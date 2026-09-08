@@ -72,6 +72,26 @@
 
 也可以在终端直接输入 `ykt_signin` 启动前后端并自动打开 UI。
 
+#### 安装终端启动命令
+
+macOS / Linux 在项目根目录执行：
+
+```bash
+chmod +x scripts/install.sh
+./scripts/install.sh
+```
+
+如果提示需要配置 PATH，将 `~/.local/bin` 加入 PATH 后重新打开终端；之后可在任意目录运行 `ykt_signin`。
+
+Windows PowerShell 在项目根目录执行：
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\scripts\install.ps1
+```
+
+安装器会把 `ykt_signin` 写入用户 PATH；请打开新的 PowerShell 窗口后运行 `ykt_signin`。首次运行前仍需安装 Python、Node.js 依赖，并执行 `pip install -r backend/requirements.txt` 与 `npm install --prefix frontend`。
+
 ### 方式三：Docker（服务器部署推荐）
 
 1. 下载并安装 Docker
@@ -195,6 +215,26 @@ The dashboard’s “Global Answer Mode” overrides each course’s quiz mode: 
 1. Open <http://localhost:5173> in your browser to use the app
 
 You can also run `ykt_signin` from any terminal to start both services and open the UI automatically.
+
+#### Install the terminal launcher
+
+On macOS/Linux, run this from the project root:
+
+```bash
+chmod +x scripts/install.sh
+./scripts/install.sh
+```
+
+If prompted, add `~/.local/bin` to `PATH`, reopen the terminal, and run `ykt_signin` from any directory.
+
+On Windows PowerShell, run:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\scripts\install.ps1
+```
+
+Open a new PowerShell window and run `ykt_signin`. Install Python/Node.js dependencies first with `pip install -r backend/requirements.txt` and `npm install --prefix frontend`.
 
 ### Option 3: Docker (Recommended for Server Deployments)
 
