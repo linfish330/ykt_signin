@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import type { NotificationSub as VoiceConfig, CourseItem } from '../types'
+import type { AiAnsweringMode, AiAnsweringSettings, AutoCheckinSettings, CheckinSourceSettings, NotificationSub as VoiceConfig, CourseItem } from '../types'
 import { useAccounts } from '../hooks/useAccounts'
 
 interface ActiveLesson {
@@ -8,6 +8,26 @@ interface ActiveLesson {
   lessonname: string
   classroomid: number
   teacher_name: string | null
+}
+
+interface ProblemReview {
+  problem_id: string | number
+  problem_type: number
+  content: string
+  cover_url?: string
+  options: { key: string; text: string }[]
+}
+
+interface PendingAnswer {
+  answer_id: string
+  lesson?: string
+  lessonid?: string | number
+  problemid?: string | number
+  problemtype?: number
+  problem: ProblemReview
+  answer: unknown
+  source: 'ai' | 'random' | 'off'
+  answer_ready: boolean
 }
 
 interface ActivityEvent {
@@ -19,10 +39,19 @@ interface ActivityEvent {
   status?: string
   message?: string
   content?: string
-  answers?: unknown[]
+  answers?: unknown
   problemid?: unknown
   problemtype?: number
-  source?: string
+  source?: string | number
+  pending_answer_id?: string
+}
+
+interface QRCheckinState {
+  status: 'scanning' | 'success' | 'error'
+  lesson_id?: string | number
+  already_running?: boolean
+  code?: string | number
+  message?: string
 }
 
 const VOICE_SUBOPTION: Partial<Record<string, keyof Omit<VoiceConfig, 'enabled'>>> = {
@@ -35,6 +64,141 @@ const VOICE_SUBOPTION: Partial<Record<string, keyof Omit<VoiceConfig, 'enabled'>
 }
 
 let eventCounter = 0
+
+function formatAnswer(answer: unknown): string {
+  if (Array.isArray(answer)) return answer.join(', ')
+  if (answer && typeof answer === 'object') return JSON.stringify(answer)
+  return answer == null ? '' : String(answer)
+}
+
+function normalizeAiAnsweringMode(settings: AiAnsweringSettings): AiAnsweringMode {
+  if (settings.ai_answering_mode === 'ai' || settings.ai_answering_mode === 'random' || settings.ai_answering_mode === 'off') {
+    return settings.ai_answering_mode
+  }
+  return settings.ai_answering_enabled ? 'ai' : 'off'
+}
+
+function normalizePendingAnswer(message: Record<string, unknown>): PendingAnswer | null {
+  if (typeof message.answer_id !== 'string' || !message.problem || typeof message.problem !== 'object') {
+    return null
+  }
+
+  const raw = message.problem as Record<string, unknown>
+  const options = Array.isArray(raw.options)
+    ? raw.options.flatMap((option) => {
+      if (!option || typeof option !== 'object') return []
+      const item = option as Record<string, unknown>
+      return [{
+        key: String(item.key ?? ''),
+        text: typeof item.text === 'string' ? item.text : '',
+      }]
+    })
+    : []
+
+  const problemType = typeof raw.problem_type === 'number'
+    ? raw.problem_type
+    : typeof message.problemtype === 'number' ? message.problemtype : 0
+
+  return {
+    answer_id: message.answer_id,
+    lesson: typeof message.lesson === 'string' ? message.lesson : undefined,
+    lessonid: typeof message.lessonid === 'string' || typeof message.lessonid === 'number' ? message.lessonid : undefined,
+    problemid: typeof message.problemid === 'string' || typeof message.problemid === 'number' ? message.problemid : undefined,
+    problemtype: typeof message.problemtype === 'number' ? message.problemtype : undefined,
+    problem: {
+      problem_id: typeof raw.problem_id === 'string' || typeof raw.problem_id === 'number' ? raw.problem_id : '',
+      problem_type: problemType,
+      content: typeof raw.content === 'string' ? raw.content : '',
+      cover_url: typeof raw.cover_url === 'string' ? raw.cover_url : '',
+      options,
+    },
+    answer: message.answer,
+    source: message.source === 'random' ? 'random' : message.source === 'off' ? 'off' : 'ai',
+    answer_ready: message.answer_ready === true || (message.answer_ready === undefined && message.answer != null),
+  }
+}
+
+function AnswerReviewModal({
+  answer,
+  busy,
+  error,
+  onConfirm,
+  onSkip,
+}: {
+  answer: PendingAnswer
+  busy: boolean
+  error: string
+  onConfirm: () => void
+  onSkip: () => void
+}) {
+  const { t } = useTranslation()
+  const problem = answer.problem
+  const problemTypeLabel = problem.problem_type ? t(`events.problemType${problem.problem_type}`) : ''
+
+  return (
+    <div className="answer-review-backdrop">
+      <section
+        className="answer-review-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="answer-review-title"
+      >
+        <div className="answer-review-header">
+          <div>
+            <span className="answer-review-eyebrow">{t('dashboard.answerReviewEyebrow')}</span>
+            <h2 id="answer-review-title">{t('dashboard.answerReviewTitle')}</h2>
+            <p>{answer.lesson ? `${answer.lesson}${problemTypeLabel ? ` · ${problemTypeLabel}` : ''}` : problemTypeLabel}</p>
+          </div>
+        </div>
+
+        {problem.cover_url && (
+          <img className="answer-review-image" src={problem.cover_url} alt={t('dashboard.answerReviewImageAlt')} />
+        )}
+
+        <div className="answer-review-question">
+          <span className="answer-review-label">{t('dashboard.answerReviewQuestion')}</span>
+          <p>{problem.content || t('dashboard.answerReviewNoText')}</p>
+        </div>
+
+        {problem.options.length > 0 && (
+          <ol className="answer-review-options">
+            {problem.options.map((option) => (
+              <li key={option.key}>
+                <strong>{option.key}</strong>
+                <span>{option.text || option.key}</span>
+              </li>
+            ))}
+          </ol>
+        )}
+
+        <div className="answer-review-answer">
+          <span className="answer-review-label">
+            {answer.source === 'off'
+              ? t('dashboard.answerReviewOff')
+              : answer.answer_ready
+                ? answer.source === 'ai' ? t('dashboard.answerReviewAiAnswer') : t('dashboard.answerReviewRandomAnswer')
+                : t('dashboard.answerReviewWaiting')}
+          </span>
+          {answer.answer_ready && <strong>{formatAnswer(answer.answer)}</strong>}
+        </div>
+
+        {error && <p className="answer-review-error" role="alert">{error}</p>}
+        <div className="answer-review-actions">
+          <button className="btn btn-secondary" onClick={onSkip} disabled={busy}>
+            {busy
+              ? t('dashboard.answerReviewSubmitting')
+              : answer.source === 'off' ? t('dashboard.answerReviewClose') : t('dashboard.answerReviewSkip')}
+          </button>
+          {answer.source !== 'off' && (
+            <button className="btn btn-primary" onClick={onConfirm} disabled={busy || !answer.answer_ready}>
+            {busy ? t('dashboard.answerReviewSubmitting') : t('dashboard.answerReviewConfirm')}
+            </button>
+          )}
+        </div>
+      </section>
+    </div>
+  )
+}
 
 function formatEventLabel(event: ActivityEvent, t: (key: string) => string): string {
   const typeName = t(`events.${event.type}`) || event.type
@@ -53,13 +217,7 @@ function formatEventLabel(event: ActivityEvent, t: (key: string) => string): str
         return `${lesson}${problemTypeName}: ${t('events.ai_failed')}`
       }
       const statusText = t(`events.${event.status || 'success'}`)
-      const answerText = event.answers
-        ? Array.isArray(event.answers)
-          ? event.answers.join(', ')
-          : typeof event.answers === 'object'
-            ? JSON.stringify(event.answers)
-            : String(event.answers)
-        : ''
+      const answerText = formatAnswer(event.answers)
       const sourceText = event.source ? ` [${t(`events.source_${event.source}`)}]` : ''
       return `${lesson}${problemTypeName}: ${statusText}${answerText ? `, ${t('events.answer')}: ${answerText}` : ''}${sourceText}`
     }
@@ -125,6 +283,20 @@ export default function Dashboard() {
   const accountId = activeAccount?.id ?? null
   const [allCourses, setAllCourses] = useState<CourseItem[]>([])
   const [events, setEvents] = useState<ActivityEvent[]>([])
+  const [qrUrl, setQrUrl] = useState('')
+  const [qrState, setQrState] = useState<QRCheckinState | null>(null)
+  const [qrSubmitting, setQrSubmitting] = useState(false)
+  const [checkinSettings, setCheckinSettings] = useState<CheckinSourceSettings | null>(null)
+  const [checkinSourceInput, setCheckinSourceInput] = useState('')
+  const [checkinSourceSaveStatus, setCheckinSourceSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
+  const [autoCheckinEnabled, setAutoCheckinEnabled] = useState<boolean | null>(null)
+  const [autoCheckinSaveStatus, setAutoCheckinSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
+  const [aiAnsweringMode, setAiAnsweringMode] = useState<AiAnsweringMode | null>(null)
+  const [aiAnsweringSaveStatus, setAiAnsweringSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
+  const [clearingEvents, setClearingEvents] = useState(false)
+  const [pendingAnswers, setPendingAnswers] = useState<PendingAnswer[]>([])
+  const [answerActionId, setAnswerActionId] = useState<string | null>(null)
+  const [answerActionError, setAnswerActionError] = useState('')
   const logRef = useRef<HTMLDivElement>(null)
 
   const voiceConfigsRef = useRef<Record<string, VoiceConfig>>({})
@@ -176,18 +348,217 @@ export default function Dashboard() {
       .catch(() => {})
   }, [accountId])
 
+  const fetchMonitorSettings = useCallback(() => {
+    if (!accountId) return
+    Promise.all([
+      fetch(`/api/accounts/${accountId}/checkin-source`).then((r) => r.json()),
+      fetch(`/api/accounts/${accountId}/auto-checkin`).then((r) => r.json()),
+      fetch(`/api/accounts/${accountId}/ai-answering`).then((r) => r.json()),
+    ])
+      .then(([source, auto, ai]: [CheckinSourceSettings, AutoCheckinSettings, AiAnsweringSettings]) => {
+        setCheckinSettings(source)
+        setCheckinSourceInput(String(source.checkin_source))
+        setAutoCheckinEnabled(auto.auto_checkin)
+        setAiAnsweringMode(normalizeAiAnsweringMode(ai))
+      })
+      .catch(() => {
+        setCheckinSettings(null)
+        setAutoCheckinEnabled(null)
+        setAiAnsweringMode(null)
+      })
+  }, [accountId])
+
+  const fetchPendingAnswers = useCallback(() => {
+    if (!accountId) return
+    fetch(`/api/accounts/${accountId}/pending-answers`)
+      .then((response) => {
+        if (!response.ok) throw new Error('Failed to load pending answers')
+        return response.json() as Promise<{ answers?: Record<string, unknown>[] }>
+      })
+      .then((data) => {
+        setPendingAnswers((data.answers ?? []).map(normalizePendingAnswer).filter((item): item is PendingAnswer => item !== null))
+      })
+      .catch(() => {})
+  }, [accountId])
+
   // Reload whenever active account changes
   useEffect(() => {
     if (!accountId) {
       setAllCourses([])
       setEvents([])
+      setQrUrl('')
+      setQrState(null)
+      setCheckinSettings(null)
+      setCheckinSourceInput('')
+      setCheckinSourceSaveStatus('idle')
+      setAutoCheckinEnabled(null)
+      setAutoCheckinSaveStatus('idle')
+      setAiAnsweringMode(null)
+      setAiAnsweringSaveStatus('idle')
+      setPendingAnswers([])
+      setAnswerActionId(null)
+      setAnswerActionError('')
       return
     }
     setEvents([]) // clear stale events from previous account
+    setPendingAnswers([])
+    setAnswerActionId(null)
+    setAnswerActionError('')
     fetchAllCourses()
     fetchLessons()
     fetchCourseConfigs()
-  }, [accountId, fetchAllCourses, fetchLessons, fetchCourseConfigs])
+    fetchMonitorSettings()
+    fetchPendingAnswers()
+  }, [accountId, fetchAllCourses, fetchLessons, fetchCourseConfigs, fetchMonitorSettings, fetchPendingAnswers])
+
+  const handleSaveCheckinSource = async () => {
+    if (!accountId || !checkinSettings) return
+    const source = Number(checkinSourceInput)
+    if (!Number.isInteger(source) || !checkinSettings.options.some((option) => option.value === source)) {
+      setCheckinSourceSaveStatus('error')
+      return
+    }
+
+    setCheckinSourceSaveStatus('saving')
+    try {
+      const response = await fetch(`/api/accounts/${accountId}/checkin-source`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ checkin_source: source }),
+      })
+      if (!response.ok) throw new Error('Save failed')
+      const data = await response.json() as { checkin_source: number }
+      setCheckinSettings((previous) => previous ? { ...previous, checkin_source: data.checkin_source } : previous)
+      setCheckinSourceInput(String(data.checkin_source))
+      setCheckinSourceSaveStatus('saved')
+      setTimeout(() => setCheckinSourceSaveStatus('idle'), 2000)
+    } catch {
+      setCheckinSourceSaveStatus('error')
+    }
+  }
+
+  const handleAutoCheckinChange = async (enabled: boolean) => {
+    if (!accountId || autoCheckinEnabled === null || enabled === autoCheckinEnabled) return
+    const previous = autoCheckinEnabled
+    setAutoCheckinEnabled(enabled)
+    setAutoCheckinSaveStatus('saving')
+    try {
+      const response = await fetch(`/api/accounts/${accountId}/auto-checkin`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ auto_checkin: enabled }),
+      })
+      if (!response.ok) throw new Error('Save failed')
+      const data = await response.json() as { auto_checkin: boolean }
+      setAutoCheckinEnabled(data.auto_checkin)
+      setAutoCheckinSaveStatus('saved')
+      setTimeout(() => setAutoCheckinSaveStatus('idle'), 2000)
+    } catch {
+      setAutoCheckinEnabled(previous)
+      setAutoCheckinSaveStatus('error')
+    }
+  }
+
+  const handleAiAnsweringChange = async (mode: AiAnsweringMode) => {
+    if (!accountId || aiAnsweringMode === null || mode === aiAnsweringMode) return
+    const previous = aiAnsweringMode
+    setAiAnsweringMode(mode)
+    setAiAnsweringSaveStatus('saving')
+    try {
+      const response = await fetch(`/api/accounts/${accountId}/ai-answering`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ai_answering_mode: mode }),
+      })
+      if (!response.ok) throw new Error('Save failed')
+      const data = await response.json() as AiAnsweringSettings
+      setAiAnsweringMode(normalizeAiAnsweringMode(data))
+      setAiAnsweringSaveStatus('saved')
+      setTimeout(() => setAiAnsweringSaveStatus('idle'), 2000)
+    } catch {
+      setAiAnsweringMode(previous)
+      setAiAnsweringSaveStatus('error')
+    }
+  }
+
+  const handleQrCheckin = async () => {
+    if (!accountId) return
+    const value = qrUrl.trim()
+    if (!value) {
+      setQrState({ status: 'error', code: 'invalid_qr_url', message: t('dashboard.qrEmpty') })
+      return
+    }
+    setQrSubmitting(true)
+    setQrState({ status: 'scanning' })
+    try {
+      const response = await fetch(`/api/accounts/${accountId}/checkin/qr`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: value }),
+      })
+      const data = await response.json() as {
+        ok?: boolean
+        lesson_id?: string | number
+        already_running?: boolean
+        code?: string | number
+        message?: string
+      }
+      if (!response.ok || !data.ok) {
+        setQrState({
+          status: 'error',
+          code: data.code ?? response.status,
+          message: data.message || t('dashboard.qrFailed'),
+        })
+        return
+      }
+      setQrState({
+        status: 'success',
+        lesson_id: data.lesson_id,
+        already_running: data.already_running,
+      })
+      fetchAllCourses()
+      fetchLessons()
+    } catch {
+      setQrState({ status: 'error', code: 'network_error', message: t('dashboard.qrFailed') })
+    } finally {
+      setQrSubmitting(false)
+    }
+  }
+
+  const handleClearEvents = async () => {
+    if (!accountId || clearingEvents || events.length === 0) return
+    if (!window.confirm(t('dashboard.clearActivityConfirm'))) return
+
+    setClearingEvents(true)
+    try {
+      const response = await fetch(`/api/accounts/${accountId}/events`, { method: 'DELETE' })
+      if (!response.ok) throw new Error('Clear failed')
+      setEvents([])
+    } catch {
+      window.alert(t('dashboard.clearActivityFailed'))
+    } finally {
+      setClearingEvents(false)
+    }
+  }
+
+  const handleAnswerDecision = async (decision: 'confirm' | 'skip') => {
+    const pending = pendingAnswers[0]
+    if (!accountId || !pending || answerActionId) return
+
+    setAnswerActionId(pending.answer_id)
+    setAnswerActionError('')
+    try {
+      const response = await fetch(`/api/accounts/${accountId}/pending-answers/${pending.answer_id}/${decision}`, {
+        method: 'POST',
+      })
+      if (!response.ok) throw new Error('Answer decision failed')
+      setPendingAnswers((previous) => previous.filter((item) => item.answer_id !== pending.answer_id))
+    } catch {
+      setAnswerActionError(t('dashboard.answerReviewFailed'))
+    } finally {
+      setAnswerActionId(null)
+    }
+  }
 
   useEffect(() => {
     if ('Notification' in window && Notification.permission === 'default') {
@@ -234,6 +605,48 @@ export default function Dashboard() {
         const t = msg['type'] as string
         if (t === 'heartbeat') return
 
+        if (t === 'answer_pending') {
+          const pending = normalizePendingAnswer(msg)
+          if (pending) {
+            setPendingAnswers((previous) => {
+              const index = previous.findIndex((item) => item.answer_id === pending.answer_id)
+              if (index < 0) return [...previous, pending]
+              const next = [...previous]
+              next[index] = pending
+              return next
+            })
+          }
+          return
+        }
+
+        if (t === 'answer_updated') {
+          const answerId = msg['answer_id']
+          if (typeof answerId === 'string') {
+            setPendingAnswers((previous) => previous.map((item) => item.answer_id === answerId
+              ? {
+                ...item,
+                answer: msg['answer'],
+                source: msg['source'] === 'random' ? 'random' : msg['source'] === 'off' ? 'off' : item.source,
+                answer_ready: msg['answer_ready'] === true,
+              }
+              : item))
+          }
+          return
+        }
+
+        if (t === 'answer_review_closed') {
+          const answerId = msg['answer_id']
+          if (typeof answerId === 'string') {
+            setPendingAnswers((previous) => previous.filter((item) => item.answer_id !== answerId))
+          }
+          return
+        }
+
+        if (t === 'events_cleared') {
+          setEvents([])
+          return
+        }
+
         if (t === 'history') {
           const raw = (msg['events'] as Record<string, unknown>[]) ?? []
           const historical: ActivityEvent[] = raw.map((m) => ({
@@ -245,15 +658,17 @@ export default function Dashboard() {
             status: m['status'] as string | undefined,
             message: m['message'] as string | undefined,
             content: m['content'] as string | undefined,
-            answers: m['answers'] as unknown[] | undefined,
+            answers: m['answers'],
             problemid: m['problemid'],
             problemtype: m['problemtype'] as number | undefined,
-            source: m['source'] as string | undefined,
+            source: m['source'] as string | number | undefined,
+            pending_answer_id: m['pending_answer_id'] as string | undefined,
           }))
           setEvents(historical.reverse())
           fetchAllCourses()
           fetchLessons()
           fetchCourseConfigs()
+          fetchPendingAnswers()
           return
         }
 
@@ -266,12 +681,16 @@ export default function Dashboard() {
           status: msg['status'] as string | undefined,
           message: msg['message'] as string | undefined,
           content: msg['content'] as string | undefined,
-          answers: msg['answers'] as unknown[] | undefined,
+          answers: msg['answers'],
           problemid: msg['problemid'],
           problemtype: msg['problemtype'] as number | undefined,
-          source: msg['source'] as string | undefined,
+          source: msg['source'] as string | number | undefined,
+          pending_answer_id: msg['pending_answer_id'] as string | undefined,
         }
 
+        if (event.pending_answer_id) {
+          setPendingAnswers((previous) => previous.filter((item) => item.answer_id !== event.pending_answer_id))
+        }
         setEvents((prev) => [event, ...prev].slice(0, 50))
 
         if (event.type === 'lesson_start' || event.type === 'lesson_end') {
@@ -309,7 +728,7 @@ export default function Dashboard() {
       if (reconnectTimer) clearTimeout(reconnectTimer)
       ws?.close()
     }
-  }, [accountId, fetchAllCourses, fetchLessons, fetchCourseConfigs])
+  }, [accountId, fetchAllCourses, fetchLessons, fetchCourseConfigs, fetchPendingAnswers])
 
   useEffect(() => {
     if (logRef.current) {
@@ -319,6 +738,165 @@ export default function Dashboard() {
 
   return (
     <div className="page">
+      {pendingAnswers.length > 0 && (
+        <AnswerReviewModal
+          answer={pendingAnswers[0]}
+          busy={answerActionId === pendingAnswers[0].answer_id}
+          error={answerActionError}
+          onConfirm={() => void handleAnswerDecision('confirm')}
+          onSkip={() => void handleAnswerDecision('skip')}
+        />
+      )}
+      <section className="card qr-checkin-card">
+        <div className="qr-checkin-heading">
+          <div>
+            <h2 className="card-title">{t('dashboard.qrCheckin')}</h2>
+            <p className="card-description">{t('dashboard.qrCheckinDesc')}</p>
+          </div>
+          <span className="badge badge-blue">{t('dashboard.qrSourceBadge')}</span>
+        </div>
+        <div className="qr-checkin-form">
+          <input
+            className="form-input"
+            type="text"
+            value={qrUrl}
+            placeholder={t('dashboard.qrPlaceholder')}
+            onChange={(e) => {
+              setQrUrl(e.target.value)
+              if (qrState?.status === 'error') setQrState(null)
+            }}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') void handleQrCheckin()
+            }}
+            disabled={qrSubmitting}
+          />
+          <button className="btn btn-primary" onClick={() => void handleQrCheckin()} disabled={qrSubmitting}>
+            {qrSubmitting ? t('dashboard.qrChecking') : t('dashboard.qrSubmit')}
+          </button>
+        </div>
+        {qrState && (
+          <div className={`qr-checkin-status ${qrState.status}`} aria-live="polite">
+            {qrState.status === 'scanning' && (
+              <>
+                <div className="qr-progress-row active"><span className="qr-progress-dot" />{t('dashboard.qrScanning')}</div>
+                <div className="qr-progress-row active"><span className="qr-progress-dot" />{t('dashboard.qrJoining')}</div>
+              </>
+            )}
+            {qrState.status === 'success' && (
+              <>
+                <div className="qr-progress-row complete"><span className="qr-progress-dot" />{t('dashboard.qrParsed')}</div>
+                <div className="qr-progress-row complete"><span className="qr-progress-dot" />{t('dashboard.qrLessonId')}: <code>{qrState.lesson_id}</code></div>
+                <div className="qr-progress-row complete"><span className="qr-progress-dot" />{qrState.already_running ? t('dashboard.qrAlreadyRunning') : t('dashboard.qrSuccess')}</div>
+              </>
+            )}
+            {qrState.status === 'error' && (
+              <div className="qr-error-message">
+                <strong>{t('dashboard.qrFailed')}</strong>
+                <span>{qrState.message}</span>
+                {qrState.code !== undefined && <code>{String(qrState.code)}</code>}
+              </div>
+            )}
+          </div>
+        )}
+      </section>
+      <section className="card dashboard-monitor-card">
+        <div className="dashboard-settings-heading">
+          <div>
+            <h2 className="card-title">{t('dashboard.monitorSettings')}</h2>
+            <p className="card-description">{t('dashboard.monitorSettingsDesc')}</p>
+          </div>
+        </div>
+        <div className="dashboard-settings-grid">
+          <div className="dashboard-setting">
+            <div className="dashboard-setting-copy">
+              <span className="form-label">{t('dashboard.checkinSource')}</span>
+              <span className="dashboard-setting-help">{t('dashboard.checkinSourceDesc')}</span>
+            </div>
+            <div className="dashboard-setting-control">
+              <div className="checkin-source-control">
+                <select
+                  className="form-select"
+                  value={checkinSourceInput}
+                  disabled={!checkinSettings || checkinSourceSaveStatus === 'saving'}
+                  onChange={(e) => {
+                    setCheckinSourceInput(e.target.value)
+                    setCheckinSourceSaveStatus('idle')
+                  }}
+                >
+                  {checkinSettings?.options.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {i18n.language.startsWith('zh') ? option.label_zh : option.label} ({option.value})
+                    </option>
+                  ))}
+                </select>
+                <button
+                  className={`btn btn-sm ${checkinSourceSaveStatus === 'saved' ? 'btn-success' : checkinSourceSaveStatus === 'error' ? 'btn-danger' : 'btn-primary'}`}
+                  onClick={() => void handleSaveCheckinSource()}
+                  disabled={!checkinSettings || checkinSourceSaveStatus === 'saving' || checkinSourceInput === String(checkinSettings?.checkin_source ?? '')}
+                >
+                  {checkinSourceSaveStatus === 'saving'
+                    ? t('settings.applying')
+                    : checkinSourceSaveStatus === 'saved'
+                      ? t('settings.applied')
+                      : t('settings.apply')}
+                </button>
+              </div>
+              {checkinSourceSaveStatus === 'error' && <span className="dashboard-setting-status error">{t('dashboard.saveFailed')}</span>}
+            </div>
+          </div>
+
+          <div className="dashboard-setting">
+            <div className="dashboard-setting-copy">
+              <span className="form-label">{t('dashboard.autoCheckin')}</span>
+              <span className="dashboard-setting-help">{t('dashboard.autoCheckinDesc')}</span>
+            </div>
+            <div className="dashboard-setting-control">
+              <div className="toggle-group" role="group" aria-label={t('dashboard.autoCheckin')}>
+                <button
+                  className={`toggle-option ${autoCheckinEnabled === true ? 'selected' : ''}`}
+                  onClick={() => void handleAutoCheckinChange(true)}
+                  disabled={autoCheckinEnabled === null || autoCheckinSaveStatus === 'saving'}
+                >
+                  {t('common.on')}
+                </button>
+                <button
+                  className={`toggle-option ${autoCheckinEnabled === false ? 'selected' : ''}`}
+                  onClick={() => void handleAutoCheckinChange(false)}
+                  disabled={autoCheckinEnabled === null || autoCheckinSaveStatus === 'saving'}
+                >
+                  {t('common.off')}
+                </button>
+              </div>
+              {autoCheckinSaveStatus === 'saving' && <span className="dashboard-setting-status">{t('settings.applying')}</span>}
+              {autoCheckinSaveStatus === 'saved' && <span className="dashboard-setting-status success">{t('settings.applied')}</span>}
+              {autoCheckinSaveStatus === 'error' && <span className="dashboard-setting-status error">{t('dashboard.saveFailed')}</span>}
+            </div>
+          </div>
+
+          <div className="dashboard-setting">
+            <div className="dashboard-setting-copy">
+              <span className="form-label">{t('dashboard.aiAnswering')}</span>
+              <span className="dashboard-setting-help">{t('dashboard.aiAnsweringDesc')}</span>
+            </div>
+            <div className="dashboard-setting-control">
+              <select
+                className="form-select"
+                aria-label={t('dashboard.aiAnswering')}
+                value={aiAnsweringMode ?? 'off'}
+                onChange={(event) => void handleAiAnsweringChange(event.target.value as AiAnsweringMode)}
+                disabled={aiAnsweringMode === null || aiAnsweringSaveStatus === 'saving'}
+              >
+                <option value="ai">AI</option>
+                <option value="random">{t('settings.random')}</option>
+                <option value="off">{t('settings.disabled')}</option>
+              </select>
+              {aiAnsweringSaveStatus === 'saving' && <span className="dashboard-setting-status">{t('settings.applying')}</span>}
+              {aiAnsweringSaveStatus === 'saved' && <span className="dashboard-setting-status success">{t('settings.applied')}</span>}
+              {aiAnsweringSaveStatus === 'error' && <span className="dashboard-setting-status error">{t('dashboard.saveFailed')}</span>}
+            </div>
+          </div>
+        </div>
+      </section>
       <section className="card">
         <h2 className="card-title">{t('dashboard.allCourses')}</h2>
         {allCourses.length === 0 ? (
@@ -350,7 +928,16 @@ export default function Dashboard() {
       </section>
 
       <section className="card">
-        <h2 className="card-title">{t('dashboard.recentActivity')}</h2>
+        <div className="activity-heading">
+          <h2 className="card-title">{t('dashboard.recentActivity')}</h2>
+          <button
+            className="btn btn-secondary btn-sm"
+            onClick={() => void handleClearEvents()}
+            disabled={clearingEvents || events.length === 0}
+          >
+            {clearingEvents ? t('dashboard.clearingActivity') : t('dashboard.clearActivity')}
+          </button>
+        </div>
         {events.length === 0 ? (
           <p className="empty-message">{t('dashboard.noActivity')}</p>
         ) : (

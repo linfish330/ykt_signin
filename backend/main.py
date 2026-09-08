@@ -23,7 +23,7 @@ for _name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
         _h.setFormatter(_fmt)
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional, Union
 
 import base64
 
@@ -34,20 +34,22 @@ import websocket
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
+from checkin import CheckinError, RainClassroomClient
 import event_log
 import pushdeer
 from config import (
-    DEFAULT_COURSE_CONFIG, DEFAULT_DOMAIN, DEFAULT_POLL_INTERVAL, DOMAIN_OPTIONS,
-    MAX_POLL_INTERVAL, MIN_POLL_INTERVAL,
+    CHECKIN_SOURCE_OPTIONS, DEFAULT_CHECKIN_SOURCE, DEFAULT_COURSE_CONFIG, DEFAULT_DOMAIN,
+    DEFAULT_AI_ANSWERING_MODE, DEFAULT_AUTO_CHECKIN, DEFAULT_CHECKIN_DELAY, DEFAULT_POLL_INTERVAL, DOMAIN_OPTIONS, QR_CHECKIN_SOURCE,
+    MAX_CHECKIN_DELAY, MAX_POLL_INTERVAL, MIN_CHECKIN_DELAY, MIN_POLL_INTERVAL,
     _config_lock,
     account_exists, api_url, delete_account,
-    get_account, get_active_account_id, get_ai_config, get_config,
-    get_course_config, get_domain, get_poll_interval, get_pushdeer_config, get_sessionid,
+    get_account, get_active_account_id, get_ai_config, get_checkin_source, get_config,
+    get_ai_answering_mode, get_auto_checkin, get_checkin_delay, get_course_config, get_domain, get_poll_interval, get_pushdeer_config, get_sessionid,
     http_request, list_accounts_summary, make_headers, new_empty_account,
     save_config, set_active_account_id, set_domain, set_poll_interval,
-    update_account, update_ai_config, update_course_config, update_pushdeer_config,
+    set_ai_answering_enabled, set_ai_answering_mode, set_auto_checkin, set_checkin_delay, set_checkin_source, update_account, update_ai_config, update_course_config, update_pushdeer_config,
     upsert_account,
 )
 from monitor import Monitor
@@ -296,7 +298,12 @@ async def _pushdeer_heartbeat_scheduler():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global event_queue
     loop = asyncio.get_running_loop()
+    # asyncio.Queue binds to the event loop that first awaits it.  Recreate it
+    # for each application lifespan so TestClient reloads and controlled
+    # restarts cannot inherit a queue tied to a previous loop.
+    event_queue = asyncio.Queue()
 
     broadcaster = asyncio.create_task(_broadcast_events())
     heartbeat_task = asyncio.create_task(_pushdeer_heartbeat_scheduler())
@@ -351,25 +358,92 @@ class NotificationSub(BaseModel):
 
 
 class CourseConfig(BaseModel):
-    type1: str
-    type2: str
-    type3: str
-    type4: str
-    type5: str
+    type1: Literal["ai", "random", "off"]
+    type2: Literal["ai", "random", "off"]
+    type3: Literal["ai", "random", "off"]
+    type4: Literal["ai", "random", "off"]
+    type5: Literal["ai", "random", "off"]
     course_enabled: bool = True
     answer_last5s: bool = True
     auto_danmu: bool
     auto_redpacket: bool = True
     danmu_threshold: int
+    checkin_source: Union[int, Literal["inherit"], None] = "inherit"
     notification: NotificationSub
     voice_notification: NotificationSub
     pushdeer_notification: NotificationSub
 
+    @field_validator("checkin_source")
+    @classmethod
+    def validate_source(cls, value: Union[int, str, None]) -> Union[int, str, None]:
+        if value is None or value == "inherit":
+            return value
+        if isinstance(value, bool):
+            raise ValueError("unsupported checkin_source")
+        if value not in {option["value"] for option in CHECKIN_SOURCE_OPTIONS}:
+            raise ValueError("unsupported checkin_source")
+        return value
+
+
+class CheckinSourceBody(BaseModel):
+    checkin_source: int
+
+    @field_validator("checkin_source")
+    @classmethod
+    def validate_source(cls, value: int) -> int:
+        if isinstance(value, bool):
+            raise ValueError("unsupported checkin_source")
+        if value not in {option["value"] for option in CHECKIN_SOURCE_OPTIONS}:
+            raise ValueError("unsupported checkin_source")
+        return value
+
+
+class AutoCheckinBody(BaseModel):
+    auto_checkin: bool
+
+
+class AiAnsweringBody(BaseModel):
+    ai_answering_mode: Optional[Literal["ai", "random", "off"]] = None
+    # Backward-compatible request field for existing clients.
+    ai_answering_enabled: Optional[bool] = None
+
+
+class QRCheckinBody(BaseModel):
+    url: str = Field(min_length=1, max_length=4096)
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("QR code content cannot be empty")
+        return value
+
 
 class AIKeyEntry(BaseModel):
-    name: str
-    provider: str
-    key: str
+    name: str = "DeepSeek"
+    provider: str = "deepseek"
+    key: str = Field(min_length=1, max_length=512)
+
+    @field_validator("key")
+    @classmethod
+    def normalize_key(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("key cannot be empty")
+        return value
+
+
+class DeepSeekKeyBody(BaseModel):
+    api_key: str = Field(min_length=1, max_length=512)
+
+    @field_validator("api_key")
+    @classmethod
+    def normalize_api_key(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("api_key cannot be empty")
+        return value
 
 
 class AIActiveKey(BaseModel):
@@ -392,6 +466,10 @@ class PushdeerLanguage(BaseModel):
 
 class PollIntervalBody(BaseModel):
     poll_interval: int
+
+
+class CheckinDelayBody(BaseModel):
+    checkin_delay: int
 
 
 class DomainPatch(BaseModel):
@@ -425,6 +503,22 @@ def _require_account(account_id: str) -> dict:
     return acc
 
 
+def _emit_account_event(account_id: str, event_type: str, data: dict) -> None:
+    """Emit non-Monitor events through the same log/WebSocket path."""
+    monitor = _get_monitor(account_id)
+    if monitor is not None:
+        monitor.emit_event(event_type, data)
+        return
+    event = {"type": event_type, "account_id": account_id, **data}
+    event_log.append(account_id, event)
+    event_queue.put_nowait(event)
+
+
+def _publish_account_message(account_id: str, message_type: str, data: Optional[dict] = None) -> None:
+    """Publish a transient account message without adding it to the log."""
+    event_queue.put_nowait({"type": message_type, "account_id": account_id, **(data or {})})
+
+
 # ---------------------------------------------------------------------------
 # Global / domain options
 # ---------------------------------------------------------------------------
@@ -433,6 +527,156 @@ def _require_account(account_id: str) -> dict:
 @app.get("/api/domains")
 async def list_domains():
     return {"options": DOMAIN_OPTIONS, "default": DEFAULT_DOMAIN}
+
+
+# ---------------------------------------------------------------------------
+# Check-in source and manual QR entry
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/accounts/{account_id}/checkin-source")
+async def get_account_checkin_source(account_id: str):
+    _require_account(account_id)
+    return {
+        "checkin_source": get_checkin_source(account_id),
+        "default": DEFAULT_CHECKIN_SOURCE,
+        "options": CHECKIN_SOURCE_OPTIONS,
+    }
+
+
+@app.put("/api/accounts/{account_id}/checkin-source")
+@app.patch("/api/accounts/{account_id}/checkin-source")
+async def set_account_checkin_source(account_id: str, body: CheckinSourceBody):
+    _require_account(account_id)
+    source = set_checkin_source(account_id, body.checkin_source)
+    return {"ok": True, "checkin_source": source}
+
+
+@app.get("/api/accounts/{account_id}/auto-checkin")
+async def get_account_auto_checkin(account_id: str):
+    _require_account(account_id)
+    return {
+        "auto_checkin": get_auto_checkin(account_id),
+        "default": DEFAULT_AUTO_CHECKIN,
+    }
+
+
+@app.put("/api/accounts/{account_id}/auto-checkin")
+@app.patch("/api/accounts/{account_id}/auto-checkin")
+async def set_account_auto_checkin(account_id: str, body: AutoCheckinBody):
+    _require_account(account_id)
+    enabled = set_auto_checkin(account_id, body.auto_checkin)
+    monitor = _get_monitor(account_id)
+    if monitor:
+        monitor.wake()
+    return {"ok": True, "auto_checkin": enabled}
+
+
+@app.get("/api/accounts/{account_id}/ai-answering")
+async def get_account_ai_answering(account_id: str):
+    _require_account(account_id)
+    mode = get_ai_answering_mode(account_id)
+    return {
+        "ai_answering_mode": mode,
+        "ai_answering_enabled": mode == "ai",
+        "default": DEFAULT_AI_ANSWERING_MODE,
+    }
+
+
+@app.put("/api/accounts/{account_id}/ai-answering")
+@app.patch("/api/accounts/{account_id}/ai-answering")
+async def set_account_ai_answering(account_id: str, body: AiAnsweringBody):
+    _require_account(account_id)
+    if body.ai_answering_mode is not None:
+        mode = set_ai_answering_mode(account_id, body.ai_answering_mode)
+    elif body.ai_answering_enabled is not None:
+        mode = "ai" if set_ai_answering_enabled(account_id, body.ai_answering_enabled) else "off"
+    else:
+        raise HTTPException(status_code=422, detail="ai_answering_mode is required")
+    return {"ok": True, "ai_answering_mode": mode, "ai_answering_enabled": mode == "ai"}
+
+
+@app.post("/api/accounts/{account_id}/checkin/qr")
+async def checkin_from_qr(account_id: str, body: QRCheckinBody):
+    """Scan a pasted QR value through Yuketang, then join that lesson."""
+    _require_account(account_id)
+    monitor = _get_monitor(account_id)
+    if monitor is None:
+        _start_monitor(account_id)
+        monitor = _get_monitor(account_id)
+
+    try:
+        client = RainClassroomClient.for_account(account_id)
+        scan_result = await asyncio.to_thread(client.scan_qr_code, body.url)
+    except CheckinError as exc:
+        logging.getLogger("qr").warning(
+            "[QR] account=%s scan failed code=%s", account_id, exc.code,
+        )
+        _emit_account_event(account_id, "qr_scan", {
+            "status": "error",
+            "code": exc.code,
+            "message": exc.message,
+        })
+        return {"ok": False, "code": exc.code, "message": exc.message, "stage": exc.stage}
+
+    lesson_id = scan_result.lesson_id
+    _emit_account_event(account_id, "qr_scan", {
+        "lessonid": lesson_id,
+        "status": "success",
+        "message": "QR code parsed",
+    })
+
+    if monitor is None:
+        message = "account monitor is unavailable"
+        logging.getLogger("qr").warning("[QR] account=%s check-in failed: monitor unavailable", account_id)
+        _emit_account_event(account_id, "qr_checkin", {
+            "lessonid": lesson_id,
+            "status": "error",
+            "code": "monitor_unavailable",
+            "message": message,
+        })
+        return {"ok": False, "code": "monitor_unavailable", "message": message, "stage": "checkin"}
+
+    try:
+        _, already_running = await asyncio.to_thread(monitor.start_qr_lesson, lesson_id)
+    except CheckinError as exc:
+        logging.getLogger("qr").warning(
+            "[QR] account=%s check-in failed lesson=%s code=%s",
+            account_id, lesson_id, exc.code,
+        )
+        _emit_account_event(account_id, "qr_checkin", {
+            "lessonid": lesson_id,
+            "source": QR_CHECKIN_SOURCE,
+            "status": "error",
+            "code": exc.code,
+            "message": exc.message,
+        })
+        return {"ok": False, "code": exc.code, "message": exc.message, "stage": exc.stage}
+    except Exception:  # noqa: BLE001
+        logging.getLogger("qr").exception(
+            "[QR] account=%s check-in failed lesson=%s", account_id, lesson_id,
+        )
+        message = "unable to enter classroom"
+        _emit_account_event(account_id, "qr_checkin", {
+            "lessonid": lesson_id,
+            "source": QR_CHECKIN_SOURCE,
+            "status": "error",
+            "code": "checkin_failed",
+            "message": message,
+        })
+        return {"ok": False, "code": "checkin_failed", "message": message, "stage": "checkin"}
+
+    logging.getLogger("qr").info(
+        "[QR] account=%s check-in success lesson=%s source=%s",
+        account_id, lesson_id, QR_CHECKIN_SOURCE,
+    )
+    return {
+        "ok": True,
+        "lesson_id": lesson_id,
+        "source": QR_CHECKIN_SOURCE,
+        "already_running": already_running,
+        "stage": "already_running" if already_running else "checkin_success",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -480,6 +724,14 @@ async def delete_account_route(account_id: str):
     return {"ok": True, "active_account_id": get_active_account_id()}
 
 
+@app.delete("/api/accounts/{account_id}/events")
+async def clear_account_events(account_id: str):
+    _require_account(account_id)
+    event_log.clear(account_id)
+    _publish_account_message(account_id, "events_cleared")
+    return {"ok": True}
+
+
 @app.post("/api/accounts/{account_id}/logout")
 async def logout_account_route(account_id: str):
     _require_account(account_id)
@@ -523,6 +775,51 @@ async def set_account_poll_interval(account_id: str, body: PollIntervalBody):
     if m:
         m.wake()
     return {"ok": True, "poll_interval": clamped}
+
+
+@app.get("/api/accounts/{account_id}/checkin-delay")
+async def get_account_checkin_delay(account_id: str):
+    _require_account(account_id)
+    return {
+        "checkin_delay": get_checkin_delay(account_id),
+        "default": DEFAULT_CHECKIN_DELAY,
+        "min": MIN_CHECKIN_DELAY,
+        "max": MAX_CHECKIN_DELAY,
+    }
+
+
+@app.put("/api/accounts/{account_id}/checkin-delay")
+@app.patch("/api/accounts/{account_id}/checkin-delay")
+async def set_account_checkin_delay(account_id: str, body: CheckinDelayBody):
+    _require_account(account_id)
+    clamped = set_checkin_delay(account_id, body.checkin_delay)
+    return {"ok": True, "checkin_delay": clamped}
+
+
+@app.get("/api/accounts/{account_id}/pending-answers")
+async def get_pending_answers(account_id: str):
+    _require_account(account_id)
+    monitor = _get_monitor(account_id)
+    return {"answers": monitor.get_pending_answers() if monitor else []}
+
+
+@app.post("/api/accounts/{account_id}/pending-answers/{answer_id}/confirm")
+async def confirm_pending_answer(account_id: str, answer_id: str):
+    _require_account(account_id)
+    monitor = _get_monitor(account_id)
+    if monitor is None or not monitor.resolve_pending_answer(answer_id, "confirm"):
+        raise HTTPException(status_code=404, detail="pending answer not found")
+    return {"ok": True, "answer_id": answer_id, "decision": "confirm"}
+
+
+@app.post("/api/accounts/{account_id}/pending-answers/{answer_id}/skip")
+@app.post("/api/accounts/{account_id}/pending-answers/{answer_id}/fallback")
+async def skip_pending_answer(account_id: str, answer_id: str):
+    _require_account(account_id)
+    monitor = _get_monitor(account_id)
+    if monitor is None or not monitor.resolve_pending_answer(answer_id, "skip"):
+        raise HTTPException(status_code=404, detail="pending answer not found")
+    return {"ok": True, "answer_id": answer_id, "decision": "skip"}
 
 
 # ---------------------------------------------------------------------------
@@ -779,6 +1076,35 @@ async def add_ai_key(account_id: str, body: AIKeyEntry):
         active = 0
     update_ai_config(account_id, {"keys": keys, "active_key": active})
     return {"ok": True, "index": len(keys) - 1}
+
+
+@app.post("/api/accounts/{account_id}/ai/deepseek")
+async def save_deepseek_key(account_id: str, body: DeepSeekKeyBody):
+    """Save and activate one DeepSeek key without requiring model settings."""
+    _require_account(account_id)
+    cfg = get_ai_config(account_id)
+    keys = list(cfg.get("keys", []))
+    entry = {"name": "DeepSeek", "provider": "deepseek", "key": body.api_key}
+
+    existing_index = next(
+        (index for index, item in enumerate(keys) if item.get("provider") == "deepseek"),
+        None,
+    )
+    if existing_index is None:
+        keys.append(entry)
+        active_index = len(keys) - 1
+    else:
+        keys[existing_index] = entry
+        # Collapse duplicate legacy DeepSeek entries while preserving the
+        # order of all other configured providers.
+        keys = [
+            item for index, item in enumerate(keys)
+            if item.get("provider") != "deepseek" or index == existing_index
+        ]
+        active_index = next(index for index, item in enumerate(keys) if item is entry)
+
+    update_ai_config(account_id, {"keys": keys, "active_key": active_index})
+    return {"ok": True, "index": active_index, "provider": "deepseek", "active_key": active_index}
 
 
 @app.delete("/api/accounts/{account_id}/ai/keys/{index}")
