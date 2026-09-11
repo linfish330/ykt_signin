@@ -1,4 +1,4 @@
-import json, os, socket, subprocess, sys
+import json, os, socket, subprocess, sys, time
 from pathlib import Path
 from stop import stop
 
@@ -20,12 +20,31 @@ def _port_free(host: str, port: int) -> bool:
             return False
 
 
+def _wait_for_ports_free(host: str, ports: list[int], timeout: float = 15.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if all(_port_free(host, port) for port in ports):
+            return True
+        time.sleep(0.1)
+    return all(_port_free(host, port) for port in ports)
+
+
 def start():
     stop()
     LOG_DIR.mkdir(exist_ok=True)
 
     bind_host = "127.0.0.1" if HOST in ("127.0.0.1", "localhost") else "0.0.0.0"
-    for name, port in [("Backend", BACKEND_PORT), ("Frontend", FRONTEND_PORT)]:
+    services = [("Backend", BACKEND_PORT), ("Frontend", FRONTEND_PORT)]
+    if not _wait_for_ports_free(bind_host, [port for _, port in services]):
+        for name, port in services:
+            if not _port_free(bind_host, port):
+                sys.exit(
+                    f"Error: {name} port {port} is still in use after stopping the previous instance.\n"
+                    "  - Stop the conflicting process, or\n"
+                    "  - Set PORT / FRONTEND_PORT env vars to alternative values."
+                )
+
+    for name, port in services:
         if not _port_free(bind_host, port):
             sys.exit(
                 f"Error: {name} port {port} is already in use.\n"

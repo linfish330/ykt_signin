@@ -1,6 +1,13 @@
 import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import type { NotificationSub, CourseItem, PushdeerSettings, PushdeerKeyEntry } from '../types'
+import type {
+  CheckinDelaySettings,
+  CheckinSourceSettings,
+  NotificationSub,
+  CourseItem,
+  PushdeerSettings,
+  PushdeerKeyEntry,
+} from '../types'
 import { useAccounts } from '../hooks/useAccounts'
 
 interface CourseConfig {
@@ -15,6 +22,7 @@ interface CourseConfig {
   auto_danmu: boolean
   auto_redpacket: boolean
   danmu_threshold: number
+  checkin_source: number | 'inherit'
   notification: NotificationSub
   voice_notification: NotificationSub
   pushdeer_notification: NotificationSub
@@ -41,6 +49,7 @@ interface AIKeyEntry {
 const PROVIDER_LABELS: Record<string, string> = {
   google: 'Google',
   qwen: 'ModelScope',
+  deepseek: 'DeepSeek',
 }
 
 interface AISettings {
@@ -67,6 +76,7 @@ function buildCourseStates(allCourses: CourseItem[], settings: CoursesMap, defau
       auto_danmu: cfg.auto_danmu ?? defaults.auto_danmu,
       auto_redpacket: cfg.auto_redpacket ?? defaults.auto_redpacket,
       danmu_threshold: cfg.danmu_threshold ?? defaults.danmu_threshold,
+      checkin_source: cfg.checkin_source ?? 'inherit',
       notification: { ...defaults.notification, ...cfg.notification },
       voice_notification: { ...defaults.voice_notification, ...cfg.voice_notification },
       pushdeer_notification: { ...defaults.pushdeer_notification, ...cfg.pushdeer_notification },
@@ -161,8 +171,7 @@ function QuizModeSelect({
 
 // Full Cartesian product of (mode × answer_last5s × limit) with the resulting
 // submission behavior. Mirrors backend/lesson.py:_compute_delay /
-// _compute_ai_window. Random and Blank share identical timing logic, so they
-// share a single "Fallback" row group.
+// _compute_ai_window. Random uses the single "Random" row group.
 const TIMING_ROWS: { mode: 'Ai' | 'Fallback'; last5s: 'On' | 'Off'; limit: 'Limited' | 'Unlimited' }[] = [
   { mode: 'Ai',       last5s: 'On',  limit: 'Limited'   },
   { mode: 'Ai',       last5s: 'On',  limit: 'Unlimited' },
@@ -211,14 +220,14 @@ function TimingTooltip() {
 }
 
 export default function Settings() {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
   const { activeAccount } = useAccounts()
   const accountId = activeAccount?.id ?? null
   const base = accountId ? `/api/accounts/${accountId}` : null
   const [courses, setCourses] = useState<CourseState[]>([])
   const [loading, setLoading] = useState(true)
   const [ai, setAi] = useState<AISettings>({ keys: [], active_key: -1, fallback_keys: true })
-  const [newKey, setNewKey] = useState<AIKeyEntry>({ name: '', provider: 'qwen', key: '' })
+  const [newKey, setNewKey] = useState<AIKeyEntry>({ name: 'DeepSeek', provider: 'deepseek', key: '' })
   const [addingKey, setAddingKey] = useState(false)
   const [appliedAllFrom, setAppliedAllFrom] = useState<string | null>(null)
   const [defaults, setDefaults] = useState<CourseConfig | null>(null)
@@ -230,6 +239,12 @@ export default function Settings() {
   const [pollSettings, setPollSettings] = useState<PollIntervalSettings | null>(null)
   const [pollInput, setPollInput] = useState<string>('')
   const [pollSaveStatus, setPollSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
+  const [checkinDelaySettings, setCheckinDelaySettings] = useState<CheckinDelaySettings | null>(null)
+  const [checkinDelayInput, setCheckinDelayInput] = useState<string>('')
+  const [checkinDelaySaveStatus, setCheckinDelaySaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
+  const [checkinSettings, setCheckinSettings] = useState<CheckinSourceSettings | null>(null)
+  const [checkinSourceInput, setCheckinSourceInput] = useState<string>('')
+  const [checkinSourceSaveStatus, setCheckinSourceSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
   const savedCoursesRef = useRef<Record<string, string>>({})
 
   const reloadAi = () => {
@@ -255,8 +270,10 @@ export default function Settings() {
       fetch(`${base}/courses/defaults`).then((r) => r.json()),
       fetch(`${base}/pushdeer/settings`).then((r) => r.json()),
       fetch(`${base}/poll-interval`).then((r) => r.json()),
+      fetch(`${base}/checkin-delay`).then((r) => r.json()),
+      fetch(`${base}/checkin-source`).then((r) => r.json()),
     ])
-      .then(([allCourses, settings, aiSettings, defs, pd, poll]: [CourseItem[], CoursesMap, AISettings, CourseConfig, PushdeerSettings, PollIntervalSettings]) => {
+      .then(([allCourses, settings, aiSettings, defs, pd, poll, delay, source]: [CourseItem[], CoursesMap, AISettings, CourseConfig, PushdeerSettings, PollIntervalSettings, CheckinDelaySettings, CheckinSourceSettings]) => {
         setDefaults(defs)
         const built = buildCourseStates(allCourses, settings, defs)
         setCourses(built)
@@ -267,6 +284,10 @@ export default function Settings() {
         setPushdeer(pd)
         setPollSettings(poll)
         setPollInput(String(poll.poll_interval))
+        setCheckinDelaySettings(delay)
+        setCheckinDelayInput(String(delay.checkin_delay))
+        setCheckinSettings(source)
+        setCheckinSourceInput(String(source.checkin_source))
       })
       .catch(() => { })
       .finally(() => setLoading(false))
@@ -298,6 +319,57 @@ export default function Settings() {
     }
   }
 
+  const handleSaveCheckinSource = async () => {
+    if (!base || !checkinSettings) return
+    const source = Number(checkinSourceInput)
+    if (!Number.isInteger(source) || !checkinSettings.options.some((option) => option.value === source)) {
+      setCheckinSourceSaveStatus('error')
+      return
+    }
+    setCheckinSourceSaveStatus('saving')
+    try {
+      const resp = await fetch(`${base}/checkin-source`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ checkin_source: source }),
+      })
+      if (!resp.ok) throw new Error('Save failed')
+      const data: { ok: boolean; checkin_source: number } = await resp.json()
+      setCheckinSettings((prev) => prev ? { ...prev, checkin_source: data.checkin_source } : prev)
+      setCheckinSourceInput(String(data.checkin_source))
+      setCheckinSourceSaveStatus('saved')
+      setTimeout(() => setCheckinSourceSaveStatus('idle'), 2000)
+    } catch {
+      setCheckinSourceSaveStatus('error')
+    }
+  }
+
+  const handleSaveCheckinDelay = async () => {
+    if (!base || !checkinDelaySettings) return
+    const parsed = parseInt(checkinDelayInput, 10)
+    if (!Number.isFinite(parsed)) {
+      setCheckinDelaySaveStatus('error')
+      return
+    }
+    const clamped = Math.max(checkinDelaySettings.min, Math.min(checkinDelaySettings.max, parsed))
+    setCheckinDelaySaveStatus('saving')
+    try {
+      const resp = await fetch(`${base}/checkin-delay`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ checkin_delay: clamped }),
+      })
+      if (!resp.ok) throw new Error('Save failed')
+      const data: { ok: boolean; checkin_delay: number } = await resp.json()
+      setCheckinDelaySettings({ ...checkinDelaySettings, checkin_delay: data.checkin_delay })
+      setCheckinDelayInput(String(data.checkin_delay))
+      setCheckinDelaySaveStatus('saved')
+      setTimeout(() => setCheckinDelaySaveStatus('idle'), 2000)
+    } catch {
+      setCheckinDelaySaveStatus('error')
+    }
+  }
+
   function courseFingerprint(c: CourseState): string {
     const { courseId: _, name: __, saveStatus: ___, ...rest } = c
     return JSON.stringify(rest)
@@ -308,16 +380,16 @@ export default function Settings() {
   }
 
   const handleAddKey = async () => {
-    if (!base || !newKey.name.trim() || !newKey.key.trim()) return
+    if (!base || !newKey.key.trim()) return
     setAddingKey(true)
     try {
-      const resp = await fetch(`${base}/ai/keys`, {
+      const resp = await fetch(`${base}/ai/deepseek`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(newKey),
+        body: JSON.stringify({ api_key: newKey.key.trim() }),
       })
       if (!resp.ok) throw new Error('Add failed')
-      setNewKey({ name: '', provider: 'qwen', key: '' })
+      setNewKey({ name: 'DeepSeek', provider: 'deepseek', key: '' })
       await reloadAi()
     } catch { }
     setAddingKey(false)
@@ -430,6 +502,18 @@ export default function Settings() {
     )
   }
 
+  const handleQuizModeChange = (
+    courseId: string,
+    field: 'type1' | 'type2' | 'type3' | 'type4' | 'type5',
+    value: string,
+  ) => {
+    if (value === 'ai' && ai.keys.length === 0) {
+      window.alert(t('dashboard.aiApiKeyRequired'))
+      return
+    }
+    updateField(courseId, field, value)
+  }
+
   const handleSave = async (course: CourseState) => {
     setCourses((prev) =>
       prev.map((c) =>
@@ -452,12 +536,19 @@ export default function Settings() {
           auto_danmu: course.auto_danmu,
           auto_redpacket: course.auto_redpacket,
           danmu_threshold: course.danmu_threshold,
+          checkin_source: course.checkin_source,
           notification: course.notification,
           voice_notification: course.voice_notification,
           pushdeer_notification: course.pushdeer_notification,
         }),
       })
-      if (!resp.ok) throw new Error('Save failed')
+      const errorData = await resp.json().catch(() => null) as { detail?: { code?: string } } | null
+      if (!resp.ok) {
+        if (errorData?.detail?.code === 'ai_api_key_required') {
+          window.alert(t('dashboard.aiApiKeyRequired'))
+        }
+        throw new Error('Save failed')
+      }
       savedCoursesRef.current[course.courseId] = courseFingerprint(course)
       setCourses((prev) =>
         prev.map((c) =>
@@ -481,6 +572,15 @@ export default function Settings() {
   }
 
   const applyToAll = async (source: CourseState) => {
+    const quizFields: ('type1' | 'type2' | 'type3' | 'type4' | 'type5')[] = ['type1', 'type2', 'type3', 'type4', 'type5']
+    if (
+      ai.keys.length === 0
+      && courses.some((course) => quizFields.some((field) => source[field] === 'ai' && course[field] !== 'ai'))
+    ) {
+      window.alert(t('dashboard.aiApiKeyRequired'))
+      return
+    }
+
     const payload = {
       type1: source.type1,
       type2: source.type2,
@@ -492,6 +592,7 @@ export default function Settings() {
       auto_danmu: source.auto_danmu,
       auto_redpacket: source.auto_redpacket,
       danmu_threshold: source.danmu_threshold,
+      checkin_source: source.checkin_source,
       notification: source.notification,
       voice_notification: source.voice_notification,
       pushdeer_notification: source.pushdeer_notification,
@@ -540,6 +641,7 @@ export default function Settings() {
             auto_danmu: defaults.auto_danmu,
             auto_redpacket: defaults.auto_redpacket,
             danmu_threshold: defaults.danmu_threshold,
+            checkin_source: 'inherit',
             notification: { ...defaults.notification },
             voice_notification: { ...defaults.voice_notification },
             pushdeer_notification: { ...defaults.pushdeer_notification },
@@ -553,16 +655,6 @@ export default function Settings() {
   const choiceModes = [
     { value: 'ai', label: 'AI' },
     { value: 'random', label: t('settings.random') },
-    { value: 'off', label: t('settings.disabled') },
-  ]
-  const voteModes = [
-    { value: 'ai', label: 'AI' },
-    { value: 'random', label: t('settings.random') },
-    { value: 'off', label: t('settings.disabled') },
-  ]
-  const shortAnswerModes = [
-    { value: 'ai', label: 'AI' },
-    { value: 'blank', label: t('settings.blank') },
     { value: 'off', label: t('settings.disabled') },
   ]
 
@@ -635,38 +727,25 @@ export default function Settings() {
           <div className="credential-add-form">
             <div className="credential-add-fields">
               <input
-                type="text"
-                className="form-input"
-                value={newKey.name}
-                placeholder={t('settings.keyNamePlaceholder')}
-                onChange={(e) => setNewKey({ ...newKey, name: e.target.value })}
-              />
-              <select
-                className="form-select"
-                value={newKey.provider}
-                onChange={(e) => setNewKey({ ...newKey, provider: e.target.value })}
-              >
-                <option value="google">Google</option>
-                <option value="qwen">ModelScope</option>
-              </select>
-              <input
                 type="password"
                 className="form-input"
                 value={newKey.key}
-                placeholder={t('settings.apiKeyPlaceholder')}
+                placeholder={t('settings.deepseekApiKeyPlaceholder')}
+                aria-label={t('settings.deepseekApiKey')}
+                autoComplete="off"
                 onChange={(e) => setNewKey({ ...newKey, key: e.target.value })}
               />
             </div>
             <button
               className="btn btn-primary"
               onClick={handleAddKey}
-              disabled={addingKey || !newKey.name.trim() || !newKey.key.trim()}
+              disabled={addingKey || !newKey.key.trim()}
             >
-              {addingKey ? t('settings.applying') : t('settings.addKey')}
+              {addingKey ? t('settings.savingDeepSeek') : t('settings.saveDeepSeek')}
             </button>
           </div>
           <p className="empty-message" style={{ padding: '12px 16px 0', margin: 0, fontSize: 12 }}>
-            {t('common.betaWarning')}
+            {t('settings.deepseekApiKeyDesc')}
           </p>
         </div>
       </section>
@@ -785,6 +864,42 @@ export default function Settings() {
         <section className="settings-section">
           <h2 className="settings-section-title">{t('settings.monitorSettings')}</h2>
           <div className="card">
+            {checkinSettings && (
+              <div className="form-row checkin-source-row">
+                <label className="form-label">
+                  {t('settings.checkinSource')}
+                  <span className="tooltip-trigger" data-tooltip={t('settings.checkinSourceDesc')}>?</span>
+                </label>
+                <div className="input-with-unit checkin-source-control">
+                  <select
+                    className="form-select"
+                    value={checkinSourceInput}
+                    onChange={(e) => {
+                      setCheckinSourceInput(e.target.value)
+                      setCheckinSourceSaveStatus('idle')
+                    }}
+                  >
+                    {checkinSettings.options.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {i18n.language.startsWith('zh') ? option.label_zh : option.label} ({option.value})
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    className={`btn btn-sm ${checkinSourceSaveStatus === 'saved' ? 'btn-success' : checkinSourceSaveStatus === 'error' ? 'btn-danger' : 'btn-primary'}`}
+                    onClick={handleSaveCheckinSource}
+                    disabled={checkinSourceSaveStatus === 'saving' || checkinSourceInput === String(checkinSettings.checkin_source)}
+                  >
+                    {checkinSourceSaveStatus === 'saving'
+                      ? t('settings.applying')
+                      : checkinSourceSaveStatus === 'saved'
+                        ? t('settings.applied')
+                        : t('settings.apply')}
+                  </button>
+                </div>
+              </div>
+            )}
+            <p className="settings-help-text">{t('settings.checkinSourceDesc')}</p>
             <div className="form-row" style={{ padding: '12px 16px' }}>
               <label className="form-label">
                 {t('settings.pollInterval')}
@@ -821,6 +936,46 @@ export default function Settings() {
                 </button>
               </div>
             </div>
+            {checkinDelaySettings && (
+              <div className="form-row" style={{ padding: '12px 16px' }}>
+                <label className="form-label">
+                  {t('settings.checkinDelay')}
+                  <span
+                    className="tooltip-trigger"
+                    data-tooltip={t('settings.checkinDelayDesc', { min: checkinDelaySettings.min, max: checkinDelaySettings.max, default: checkinDelaySettings.default })}
+                  >
+                    ?
+                  </span>
+                </label>
+                <div className="input-with-unit" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                  <input
+                    type="number"
+                    className="form-input-number"
+                    aria-label={t('settings.checkinDelay')}
+                    min={checkinDelaySettings.min}
+                    max={checkinDelaySettings.max}
+                    value={checkinDelayInput}
+                    onChange={(e) => {
+                      setCheckinDelayInput(e.target.value)
+                      setCheckinDelaySaveStatus('idle')
+                    }}
+                  />
+                  <span className="input-unit">{t('settings.seconds')}</span>
+                  <button
+                    className={`btn btn-sm ${checkinDelaySaveStatus === 'saved' ? 'btn-success' : checkinDelaySaveStatus === 'error' ? 'btn-danger' : 'btn-primary'}`}
+                    onClick={handleSaveCheckinDelay}
+                    data-testid="checkin-delay-save"
+                    disabled={checkinDelaySaveStatus === 'saving' || checkinDelayInput === String(checkinDelaySettings.checkin_delay)}
+                  >
+                    {checkinDelaySaveStatus === 'saving'
+                      ? t('settings.applying')
+                      : checkinDelaySaveStatus === 'saved'
+                        ? t('settings.applied')
+                        : t('settings.apply')}
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </section>
       )}
@@ -869,6 +1024,33 @@ export default function Settings() {
                     </div>
                   </div>
 
+                  {/* Check-in source override */}
+                  <div className="settings-group">
+                    <span className="settings-group-label">{t('settings.checkinSource')}</span>
+                    <div className="form-row">
+                      <label className="form-label">
+                        {t('settings.courseCheckinSource')}
+                        <span className="tooltip-trigger" data-tooltip={t('settings.checkinSourceCourseDesc')}>?</span>
+                      </label>
+                      <select
+                        className="form-select"
+                        value={course.checkin_source === 'inherit' ? 'inherit' : String(course.checkin_source)}
+                        onChange={(e) => updateField(
+                          course.courseId,
+                          'checkin_source',
+                          e.target.value === 'inherit' ? 'inherit' : Number(e.target.value),
+                        )}
+                      >
+                        <option value="inherit">{t('settings.checkinSourceInherit')}</option>
+                        {(checkinSettings?.options ?? []).map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {i18n.language.startsWith('zh') ? option.label_zh : option.label} ({option.value})
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+
                   {/* Quiz Modes */}
                   <div className="settings-group">
                     <span className="settings-group-label">{t('settings.quizModes')}</span>
@@ -876,29 +1058,31 @@ export default function Settings() {
                       label={t('events.problemType1')}
                       value={course.type1}
                       options={choiceModes}
-                      onChange={(v) => updateField(course.courseId, 'type1', v)}
+                      onChange={(v) => handleQuizModeChange(course.courseId, 'type1', v)}
                     />
                     <QuizModeSelect
                       label={t('events.problemType2')}
                       value={course.type2}
                       options={choiceModes}
-                      onChange={(v) => updateField(course.courseId, 'type2', v)}
+                      onChange={(v) => handleQuizModeChange(course.courseId, 'type2', v)}
                     />
                     <QuizModeSelect
                       label={t('events.problemType3')}
                       value={course.type3}
-                      options={voteModes}
-                      onChange={(v) => updateField(course.courseId, 'type3', v)}
+                      options={choiceModes}
+                      onChange={(v) => handleQuizModeChange(course.courseId, 'type3', v)}
                     />
-                    <div className="form-row">
-                      <label className="form-label">{t('events.problemType4')}</label>
-                      <span className="badge badge-gray">{t('settings.reserved')}</span>
-                    </div>
+                    <QuizModeSelect
+                      label={t('events.problemType4')}
+                      value={course.type4}
+                      options={choiceModes}
+                      onChange={(v) => handleQuizModeChange(course.courseId, 'type4', v)}
+                    />
                     <QuizModeSelect
                       label={t('events.problemType5')}
                       value={course.type5}
-                      options={shortAnswerModes}
-                      onChange={(v) => updateField(course.courseId, 'type5', v)}
+                      options={choiceModes}
+                      onChange={(v) => handleQuizModeChange(course.courseId, 'type5', v)}
                     />
                   </div>
 

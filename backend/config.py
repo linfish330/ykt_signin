@@ -2,11 +2,12 @@ import copy
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time as _time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 # Bypass system proxy for Yuketang and ModelScope domains.
 _NO_PROXY_DOMAINS = ",".join([
@@ -54,6 +55,9 @@ DEFAULT_COURSE_CONFIG: dict = {
     "auto_danmu": True,
     "auto_redpacket": True,
     "danmu_threshold": 3,
+    # None means inherit the per-account default.  Keeping the value absent
+    # in older files is also supported by get_course_config().
+    "checkin_source": None,
     "notification": {
         "enabled": False,
         "signin": True, "problem": True, "call": True, "danmu": True, "red_packet": True,
@@ -68,6 +72,46 @@ DEFAULT_COURSE_CONFIG: dict = {
     },
 }
 
+ANSWER_MODES = frozenset({"ai", "random", "off"})
+
+
+def normalize_answer_mode(value: Any, default: str = "off") -> str:
+    """Keep persisted course settings inside the three supported modes."""
+    if isinstance(value, str) and value in ANSWER_MODES:
+        return str(value)
+    # Migrate the previous blank-answer option to the new random policy.
+    if value == "blank":
+        return "random"
+    return default if default in ANSWER_MODES else "off"
+
+# These values are observed in public Yuketang clients/community projects,
+# not an official public enum.  Keep the wire values centralized so the
+# monitor, manual QR flow, and API validation cannot drift apart.
+CHECKIN_SOURCE_OPTIONS = [
+    {"value": 21, "label": "QR code", "label_zh": "二维码"},
+    {"value": 23, "label": "APP classroom button", "label_zh": "APP 点击课堂"},
+    {"value": 5, "label": "WeChat / Mini Program", "label_zh": "微信/小程序"},
+    {"value": 14, "label": "PC / Web", "label_zh": "PC / Web"},
+    {"value": 22, "label": "Passcode", "label_zh": "暗号"},
+    {"value": 1, "label": "WeChat / Scan QR Code", "label_zh": "微信/扫二维码"},
+]
+CHECKIN_SOURCE_VALUES = frozenset(option["value"] for option in CHECKIN_SOURCE_OPTIONS)
+DEFAULT_CHECKIN_SOURCE = 21
+QR_CHECKIN_SOURCE = 21
+
+
+def validate_checkin_source(value: Any) -> int:
+    """Return a valid wire value or raise ValueError for API callers."""
+    if isinstance(value, bool):
+        raise ValueError("checkin_source must be an integer source value")
+    try:
+        source = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("checkin_source must be an integer source value") from exc
+    if source not in CHECKIN_SOURCE_VALUES:
+        raise ValueError("unsupported checkin_source")
+    return source
+
 DEFAULT_AI_CONFIG: dict = {"keys": [], "active_key": -1, "fallback_keys": True}
 
 DEFAULT_PUSHDEER_CONFIG: dict = {"keys": [], "active_key": -1, "language": "zh"}
@@ -76,6 +120,15 @@ DEFAULT_PUSHDEER_CONFIG: dict = {"keys": [], "active_key": -1, "language": "zh"}
 DEFAULT_POLL_INTERVAL = 60
 MIN_POLL_INTERVAL = 10
 MAX_POLL_INTERVAL = 3600
+DEFAULT_AUTO_CHECKIN = False
+AUTO_CHECKIN_MODES = ("on", "scheduled", "off")
+DEFAULT_AUTO_CHECKIN_MODE = "off"
+DEFAULT_AUTO_CHECKIN_TIME = "08:00"
+DEFAULT_AI_ANSWERING_ENABLED = True
+DEFAULT_AI_ANSWERING_MODE = "ai"
+DEFAULT_CHECKIN_DELAY = 60
+MIN_CHECKIN_DELAY = 0
+MAX_CHECKIN_DELAY = 300
 
 DOMAIN_OPTIONS = [
     {"key": "www.yuketang.cn", "label": "Yuketang", "label_zh": "雨课堂"},
@@ -84,7 +137,7 @@ DOMAIN_OPTIONS = [
     {"key": "huanghe.yuketang.cn", "label": "Huanghe Yuketang", "label_zh": "黄河雨课堂"},
 ]
 
-DEFAULT_DOMAIN = "pro.yuketang.cn"
+DEFAULT_DOMAIN = "www.yuketang.cn"
 
 
 def new_empty_account(domain: str = DEFAULT_DOMAIN) -> dict:
@@ -98,6 +151,13 @@ def new_empty_account(domain: str = DEFAULT_DOMAIN) -> dict:
         "ai": copy.deepcopy(DEFAULT_AI_CONFIG),
         "pushdeer": copy.deepcopy(DEFAULT_PUSHDEER_CONFIG),
         "poll_interval": DEFAULT_POLL_INTERVAL,
+        "checkin_delay": DEFAULT_CHECKIN_DELAY,
+        "auto_checkin": DEFAULT_AUTO_CHECKIN,
+        "auto_checkin_mode": DEFAULT_AUTO_CHECKIN_MODE,
+        "auto_checkin_time": DEFAULT_AUTO_CHECKIN_TIME,
+        "ai_answering_enabled": DEFAULT_AI_ANSWERING_ENABLED,
+        "ai_answering_mode": DEFAULT_AI_ANSWERING_MODE,
+        "checkin_source": DEFAULT_CHECKIN_SOURCE,
     }
 
 
@@ -114,6 +174,137 @@ def set_poll_interval(account_id: str, seconds: int) -> int:
     clamped = max(MIN_POLL_INTERVAL, min(MAX_POLL_INTERVAL, int(seconds)))
     update_account(account_id, {"poll_interval": clamped})
     return clamped
+
+
+def get_checkin_delay(account_id: str) -> int:
+    """Get the account-level delay before an automatic check-in."""
+    acc = get_account(account_id) or {}
+    try:
+        value = int(acc.get("checkin_delay", DEFAULT_CHECKIN_DELAY))
+    except (TypeError, ValueError):
+        value = DEFAULT_CHECKIN_DELAY
+    return max(MIN_CHECKIN_DELAY, min(MAX_CHECKIN_DELAY, value))
+
+
+def set_checkin_delay(account_id: str, seconds: int) -> int:
+    clamped = max(MIN_CHECKIN_DELAY, min(MAX_CHECKIN_DELAY, int(seconds)))
+    update_account(account_id, {"checkin_delay": clamped})
+    return clamped
+
+
+def get_auto_checkin_mode(account_id: str) -> str:
+    """Get the account-level automatic check-in mode with legacy migration."""
+    acc = get_account(account_id) or {}
+    value = acc.get("auto_checkin_mode")
+    if isinstance(value, str) and value in AUTO_CHECKIN_MODES:
+        return value
+    legacy = acc.get("auto_checkin")
+    if isinstance(legacy, bool):
+        return "on" if legacy else "off"
+    return DEFAULT_AUTO_CHECKIN_MODE
+
+
+def validate_auto_checkin_time(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("auto_checkin_time must use HH:MM format")
+    value = value.strip()
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
+        raise ValueError("auto_checkin_time must use HH:MM format")
+    return value
+
+
+def get_auto_checkin_time(account_id: str) -> str:
+    acc = get_account(account_id) or {}
+    try:
+        return validate_auto_checkin_time(acc.get("auto_checkin_time", DEFAULT_AUTO_CHECKIN_TIME))
+    except ValueError:
+        return DEFAULT_AUTO_CHECKIN_TIME
+
+
+def set_auto_checkin_mode(
+    account_id: str,
+    mode: str,
+    start_time: Optional[str] = None,
+) -> tuple[str, str]:
+    if mode not in AUTO_CHECKIN_MODES:
+        raise ValueError("auto_checkin_mode must be on, scheduled, or off")
+    schedule_time = get_auto_checkin_time(account_id) if start_time is None else validate_auto_checkin_time(start_time)
+    update_account(account_id, {
+        "auto_checkin_mode": mode,
+        "auto_checkin_time": schedule_time,
+        # Keep the legacy field enabled for the scheduled mode so older
+        # clients do not accidentally treat it as permanently disabled.
+        "auto_checkin": mode != "off",
+    })
+    return mode, schedule_time
+
+
+def get_auto_checkin(account_id: str) -> bool:
+    """Return whether automatic check-in is active at the current local time."""
+    mode = get_auto_checkin_mode(account_id)
+    if mode == "off":
+        return False
+    if mode == "scheduled":
+        return _time.strftime("%H:%M") >= get_auto_checkin_time(account_id)
+    return True
+
+
+def set_auto_checkin(account_id: str, enabled: bool) -> bool:
+    """Backward-compatible boolean setter for older API clients."""
+    if not isinstance(enabled, bool):
+        raise ValueError("auto_checkin must be a boolean")
+    set_auto_checkin_mode(account_id, "on" if enabled else "off")
+    return enabled
+
+
+def get_ai_answering_mode(account_id: str) -> str:
+    """Get the account-level answer mode, migrating the old boolean switch."""
+    acc = get_account(account_id) or {}
+    value = acc.get("ai_answering_mode")
+    if isinstance(value, str) and value in ANSWER_MODES:
+        return str(value)
+    legacy = acc.get("ai_answering_enabled")
+    if isinstance(legacy, bool):
+        return "ai" if legacy else "off"
+    return DEFAULT_AI_ANSWERING_MODE
+
+
+def set_ai_answering_mode(account_id: str, mode: str) -> str:
+    if mode not in ANSWER_MODES:
+        raise ValueError("ai_answering_mode must be ai, random, or off")
+    update_account(account_id, {
+        "ai_answering_mode": mode,
+        # Keep the legacy field in sync for older clients/config readers.
+        "ai_answering_enabled": mode == "ai",
+    })
+    return mode
+
+
+def get_ai_answering_enabled(account_id: str) -> bool:
+    """Backward-compatible boolean view of the global answer mode."""
+    return get_ai_answering_mode(account_id) == "ai"
+
+
+def set_ai_answering_enabled(account_id: str, enabled: bool) -> bool:
+    if not isinstance(enabled, bool):
+        raise ValueError("ai_answering_enabled must be a boolean")
+    set_ai_answering_mode(account_id, "ai" if enabled else "off")
+    return enabled
+
+
+def get_checkin_source(account_id: str) -> int:
+    """Get an account default, tolerating old or malformed config files."""
+    acc = get_account(account_id) or {}
+    try:
+        return validate_checkin_source(acc.get("checkin_source", DEFAULT_CHECKIN_SOURCE))
+    except ValueError:
+        return DEFAULT_CHECKIN_SOURCE
+
+
+def set_checkin_source(account_id: str, source: int) -> int:
+    validated = validate_checkin_source(source)
+    update_account(account_id, {"checkin_source": validated})
+    return validated
 
 
 _EMPTY_CONFIG = {"active_account_id": None, "accounts": {}}
@@ -248,10 +439,50 @@ def get_course_config(account_id: str, course_id: str) -> dict:
             m = dict(value)
             m.update(merged[key])
             merged[key] = m
+    for type_key in ("type1", "type2", "type3", "type4", "type5"):
+        merged[type_key] = normalize_answer_mode(merged.get(type_key), DEFAULT_COURSE_CONFIG[type_key])
     return merged
 
 
+def resolve_checkin_source(
+    account_id: str,
+    course_id: Optional[Union[str, int]] = None,
+    course_config: Optional[dict] = None,
+    *,
+    force_qr_source: bool = False,
+    source_override: Any = None,
+) -> int:
+    """Resolve the source for one classroom without leaking wire constants.
+
+    ``force_qr_source`` is intentionally explicit: a QR scan always enters
+    through source 21, even when the account default is another source.
+    Invalid persisted course values are treated as inherit so a stale config
+    cannot stop Monitor from starting.
+    """
+    if force_qr_source:
+        return QR_CHECKIN_SOURCE
+    if source_override is not None:
+        return validate_checkin_source(source_override)
+
+    if course_config is None and course_id is not None:
+        course_config = get_course_config(account_id, str(course_id))
+    course_value = (course_config or {}).get("checkin_source")
+    if course_value not in (None, "", "inherit"):
+        try:
+            return validate_checkin_source(course_value)
+        except ValueError:
+            pass
+    return get_checkin_source(account_id)
+
+
 def update_course_config(account_id: str, course_id: str, data: dict) -> None:
+    data = dict(data)
+    if "checkin_source" in data:
+        source = data["checkin_source"]
+        if source in (None, "", "inherit"):
+            data["checkin_source"] = None
+        else:
+            data["checkin_source"] = validate_checkin_source(source)
     with _config_lock:
         cfg = get_config()
         acc = cfg.setdefault("accounts", {}).setdefault(str(account_id), new_empty_account())
@@ -328,7 +559,7 @@ def http_request(
     headers = kwargs.setdefault("headers", {})
     headers.setdefault("User-Agent", _DEFAULT_UA)
 
-    last_exc: Exception | None = None
+    last_exc: Optional[Exception] = None
     for attempt in range(1, retries + 1):
         try:
             r = requests.request(method, url, **kwargs)

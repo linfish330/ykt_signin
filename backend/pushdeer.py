@@ -43,7 +43,7 @@ _EVENTS_ZH = {
     "source_random": "随机",
     "source_blank": "空答案",
     "answer": "答案",
-    "ai_failed": "AI答题失败，请手动作答！将按「最后5秒作答」设置提交随机答案（单选/多选）或空答（简答题）作为兜底",
+    "ai_failed": "AI答题失败，已降级为随机答案，等待控制台确认；最后8秒无人处理时自动提交",
 }
 
 _EVENTS_EN = {
@@ -67,7 +67,7 @@ _EVENTS_EN = {
     "source_random": "random",
     "source_blank": "blank",
     "answer": "answer(s)",
-    "ai_failed": "AI answering failed, please answer manually! A random (choice) or blank (short-answer) fallback will be submitted per the \"Answer in Last 5s\" setting",
+    "ai_failed": "AI answering failed; switched to a random answer and waiting for confirmation; auto-submit runs in the final 8 seconds if nobody responds",
 }
 
 

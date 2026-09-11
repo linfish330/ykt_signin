@@ -58,7 +58,7 @@ function AppInner() {
           </div>
           <div className="navbar-actions">
             <AccountSwitcher />
-            <button className="btn-ghost btn-sm" onClick={toggleLanguage}>
+            <button className="btn btn-ghost btn-sm" onClick={toggleLanguage}>
               {i18n.language.startsWith('zh') ? 'EN' : '中文'}
             </button>
           </div>

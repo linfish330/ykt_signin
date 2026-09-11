@@ -44,3 +44,43 @@ export interface DomainOption {
   label: string
   label_zh: string
 }
+
+export interface CheckinSourceOption {
+  value: number
+  label: string
+  label_zh: string
+}
+
+export interface CheckinSourceSettings {
+  checkin_source: number
+  default: number
+  options: CheckinSourceOption[]
+}
+
+export type AutoCheckinMode = 'on' | 'scheduled' | 'off'
+
+export interface AutoCheckinSettings {
+  auto_checkin: boolean
+  default: boolean
+  auto_checkin_mode: AutoCheckinMode
+  auto_checkin_time: string
+  default_mode: AutoCheckinMode
+  default_time: string
+  modes: AutoCheckinMode[]
+}
+
+export type AiAnsweringMode = 'ai' | 'random' | 'off'
+
+export interface AiAnsweringSettings {
+  ai_answering_mode: AiAnsweringMode
+  ai_answering_enabled: boolean
+  ai_api_key_configured: boolean
+  default: AiAnsweringMode
+}
+
+export interface CheckinDelaySettings {
+  checkin_delay: number
+  default: number
+  min: number
+  max: number
+}
