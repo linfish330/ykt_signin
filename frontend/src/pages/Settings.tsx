@@ -502,6 +502,18 @@ export default function Settings() {
     )
   }
 
+  const handleQuizModeChange = (
+    courseId: string,
+    field: 'type1' | 'type2' | 'type3' | 'type4' | 'type5',
+    value: string,
+  ) => {
+    if (value === 'ai' && ai.keys.length === 0) {
+      window.alert(t('dashboard.aiApiKeyRequired'))
+      return
+    }
+    updateField(courseId, field, value)
+  }
+
   const handleSave = async (course: CourseState) => {
     setCourses((prev) =>
       prev.map((c) =>
@@ -530,7 +542,13 @@ export default function Settings() {
           pushdeer_notification: course.pushdeer_notification,
         }),
       })
-      if (!resp.ok) throw new Error('Save failed')
+      const errorData = await resp.json().catch(() => null) as { detail?: { code?: string } } | null
+      if (!resp.ok) {
+        if (errorData?.detail?.code === 'ai_api_key_required') {
+          window.alert(t('dashboard.aiApiKeyRequired'))
+        }
+        throw new Error('Save failed')
+      }
       savedCoursesRef.current[course.courseId] = courseFingerprint(course)
       setCourses((prev) =>
         prev.map((c) =>
@@ -554,6 +572,15 @@ export default function Settings() {
   }
 
   const applyToAll = async (source: CourseState) => {
+    const quizFields: ('type1' | 'type2' | 'type3' | 'type4' | 'type5')[] = ['type1', 'type2', 'type3', 'type4', 'type5']
+    if (
+      ai.keys.length === 0
+      && courses.some((course) => quizFields.some((field) => source[field] === 'ai' && course[field] !== 'ai'))
+    ) {
+      window.alert(t('dashboard.aiApiKeyRequired'))
+      return
+    }
+
     const payload = {
       type1: source.type1,
       type2: source.type2,
@@ -1031,31 +1058,31 @@ export default function Settings() {
                       label={t('events.problemType1')}
                       value={course.type1}
                       options={choiceModes}
-                      onChange={(v) => updateField(course.courseId, 'type1', v)}
+                      onChange={(v) => handleQuizModeChange(course.courseId, 'type1', v)}
                     />
                     <QuizModeSelect
                       label={t('events.problemType2')}
                       value={course.type2}
                       options={choiceModes}
-                      onChange={(v) => updateField(course.courseId, 'type2', v)}
+                      onChange={(v) => handleQuizModeChange(course.courseId, 'type2', v)}
                     />
                     <QuizModeSelect
                       label={t('events.problemType3')}
                       value={course.type3}
                       options={choiceModes}
-                      onChange={(v) => updateField(course.courseId, 'type3', v)}
+                      onChange={(v) => handleQuizModeChange(course.courseId, 'type3', v)}
                     />
                     <QuizModeSelect
                       label={t('events.problemType4')}
                       value={course.type4}
                       options={choiceModes}
-                      onChange={(v) => updateField(course.courseId, 'type4', v)}
+                      onChange={(v) => handleQuizModeChange(course.courseId, 'type4', v)}
                     />
                     <QuizModeSelect
                       label={t('events.problemType5')}
                       value={course.type5}
                       options={choiceModes}
-                      onChange={(v) => updateField(course.courseId, 'type5', v)}
+                      onChange={(v) => handleQuizModeChange(course.courseId, 'type5', v)}
                     />
                   </div>
 

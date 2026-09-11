@@ -26,7 +26,7 @@
 - `21` — 二维码（默认推荐）
 - `22` — 暗号
 - `23` — APP 点击课堂
-- `1` — 自定义
+- `1` — 微信/扫二维码
 
 每个账号有一个全局默认值，每门课程可以选择继承默认值或单独覆盖。旧版 `config.json` 没有该字段时仍使用 `21`。
 
@@ -40,11 +40,11 @@
 
 为兼容主项目原有自动模式，Monitor 自动签到继续使用原请求字段；只有用户明确发起的 QR 入口会显式携带 `joinIfNotIn=true`。
 
-## 签到延迟与 AI 答题确认
+## 自动签到模式、签到延迟与 AI 答题确认
 
-在设置页的“监听设置”中可配置“签到延迟”（0–300 秒）。自动发现新课堂后，助手会等待该时间再发起签到；手动动态二维码签到不受此延迟影响。
+仪表盘的“自动签到”支持“开启、定时、关闭”三种模式，新账号默认关闭。开启会立即自动签到；定时模式每天到达设定的本机时间后才开始自动签到；关闭则不自动进入新课堂。设置页的“监听设置”还可配置“签到延迟”（默认 60 秒，范围 0–300 秒），自动发现新课堂后会等待该时间再发起签到；手动动态二维码签到不受此延迟影响。
 
-首页“全局答题模式”会覆盖所有课程的题型设置：AI 使用 DeepSeek，随机模式对单选、多选、投票随机选择，对填空和简答填入“1”，关闭则不答题。收到题目后仪表盘会立即弹出题目、题目截图和选项；AI 返回答案或随机候选生成后，弹窗会实时补充对应答案。AI 和随机模式可点击“确认作答”立即提交；若截止前 5 秒仍无人处理，自动使用随机规则作答并提交。关闭模式只显示题目并等待关闭。
+首页“全局答题模式”会覆盖所有课程的题型设置：AI 使用 DeepSeek，随机模式对单选、多选、投票随机选择，对填空和简答填入“1”，关闭则不答题。收到题目后仪表盘会立即弹出题目、题目截图和选项；AI 返回答案或随机候选生成后，弹窗会实时补充对应答案。AI 和随机模式可点击“确认作答”立即提交；AI 模式若截止前 8 秒仍无人处理，单选、多选、填空沿用 AI 答案，其他题型按随机规则作答并提交。关闭模式只显示题目并等待关闭。
 
 ## 快速开始
 
@@ -71,26 +71,6 @@
 1. 在浏览器中打开 <http://localhost:5173> 即可使用
 
 也可以在终端直接输入 `ykt_signin` 启动前后端并自动打开 UI。
-
-#### 安装终端启动命令
-
-macOS / Linux 在项目根目录执行：
-
-```bash
-chmod +x scripts/install.sh
-./scripts/install.sh
-```
-
-如果提示需要配置 PATH，将 `~/.local/bin` 加入 PATH 后重新打开终端；之后可在任意目录运行 `ykt_signin`。
-
-Windows PowerShell 在项目根目录执行：
-
-```powershell
-Set-ExecutionPolicy -Scope Process Bypass
-.\scripts\install.ps1
-```
-
-安装器会把 `ykt_signin` 写入用户 PATH；请打开新的 PowerShell 窗口后运行 `ykt_signin`。首次运行前仍需安装 Python、Node.js 依赖，并执行 `pip install -r backend/requirements.txt` 与 `npm install --prefix frontend`。
 
 ### 方式三：Docker（服务器部署推荐）
 
@@ -119,7 +99,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 ### DeepSeek（推荐）
 
-在设置页的 AI 设置中只需填写 DeepSeek API Key 并点击“保存并启用”。应用会自动使用 DeepSeek 的 OpenAI 兼容接口和视觉模型处理题目图片，不需要填写模型名或接口地址。
+在设置页的 AI 设置中只需填写 DeepSeek API Key 并点击“保存并启用”。应用会通过 DeepSeek 的 OpenAI 兼容接口调用 `deepseek-flash` 处理题目图片，不需要填写模型名或接口地址。
 
 - [DeepSeek API Keys](https://platform.deepseek.com/api_keys)
 
@@ -170,7 +150,7 @@ The “Check-in Source” setting is the integer `source` sent with the classroo
 - `21` — QR code (recommended default)
 - `22` — Passcode
 - `23` — APP classroom button
-- `1` — Custom
+- `1` — WeChat / Scan QR Code
 
 Each account has a default source, and each course can inherit it or override it. Older `config.json` files without this field continue to use `21`.
 
@@ -184,11 +164,11 @@ The request uses the selected account's domain, session, and headers; the host i
 
 To preserve the existing automatic mode, Monitor keeps its legacy check-in fields; only an explicit QR entry opts into `joinIfNotIn=true`.
 
-## Check-in Delay and AI Answer Review
+## Automatic Check-in Modes, Check-in Delay and AI Answer Review
 
-In Settings → Monitor Settings, configure “Check-in Delay” from 0 to 300 seconds. Automatic check-in waits for this duration after discovering a new lesson; manual dynamic QR check-in is not delayed.
+The dashboard’s “Automatic Check-in” setting supports On, Scheduled, and Off; new accounts default to Off. On starts automatic check-in immediately; Scheduled starts it each day after the configured local time; Off skips new classrooms. In Settings → Monitor Settings, configure “Check-in Delay” from 0 to 300 seconds (60 seconds by default). Automatic check-in waits for this duration after discovering a new classroom; manual dynamic QR check-in is not delayed.
 
-The dashboard’s “Global Answer Mode” overrides each course’s quiz mode: AI uses DeepSeek, Random randomly selects options for choice/voting questions and enters “1” for fill-in/short-answer questions, and Off skips answering. The dashboard immediately shows the question, screenshot, and options; the candidate answer is added when AI or the random policy is ready. DeepSeek failures automatically downgrade to a random candidate. AI and random modes support “Confirm answer”; if nobody responds by the final 5 seconds, the random policy submits automatically. Off only shows the question and never submits it.
+The dashboard’s “Global Answer Mode” overrides each course’s quiz mode: AI uses DeepSeek, Random randomly selects options for choice/voting questions and enters “1” for fill-in/short-answer questions, and Off skips answering. The dashboard immediately shows the question, screenshot, and options; the candidate answer is added when AI or the random policy is ready. DeepSeek failures automatically downgrade to a random candidate. AI and random modes support “Confirm answer”; in AI mode, if nobody responds by the final 8 seconds, single-choice, multiple-choice, and fill-in questions keep the AI answer while other question types use the random policy. Off only shows the question and never submits it.
 
 ## Quick Start
 
@@ -215,26 +195,6 @@ The dashboard’s “Global Answer Mode” overrides each course’s quiz mode: 
 1. Open <http://localhost:5173> in your browser to use the app
 
 You can also run `ykt_signin` from any terminal to start both services and open the UI automatically.
-
-#### Install the terminal launcher
-
-On macOS/Linux, run this from the project root:
-
-```bash
-chmod +x scripts/install.sh
-./scripts/install.sh
-```
-
-If prompted, add `~/.local/bin` to `PATH`, reopen the terminal, and run `ykt_signin` from any directory.
-
-On Windows PowerShell, run:
-
-```powershell
-Set-ExecutionPolicy -Scope Process Bypass
-.\scripts\install.ps1
-```
-
-Open a new PowerShell window and run `ykt_signin`. Install Python/Node.js dependencies first with `pip install -r backend/requirements.txt` and `npm install --prefix frontend`.
 
 ### Option 3: Docker (Recommended for Server Deployments)
 
@@ -263,7 +223,7 @@ Open a new PowerShell window and run `ykt_signin`. Install Python/Node.js depend
 
 ### DeepSeek (recommended)
 
-On the AI Settings page, enter only your DeepSeek API Key and click “Save and enable”. The app automatically uses DeepSeek’s OpenAI-compatible endpoint and vision model for image-based quiz questions; no model name or endpoint configuration is required.
+On the AI Settings page, enter only your DeepSeek API Key and click “Save and enable”. The app calls DeepSeek’s OpenAI-compatible endpoint with `deepseek-flash` for image-based quiz questions; no model name or endpoint configuration is required.
 
 - [DeepSeek API Keys](https://platform.deepseek.com/api_keys)
 

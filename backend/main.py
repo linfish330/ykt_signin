@@ -41,15 +41,17 @@ import event_log
 import pushdeer
 from config import (
     CHECKIN_SOURCE_OPTIONS, DEFAULT_CHECKIN_SOURCE, DEFAULT_COURSE_CONFIG, DEFAULT_DOMAIN,
-    DEFAULT_AI_ANSWERING_MODE, DEFAULT_AUTO_CHECKIN, DEFAULT_CHECKIN_DELAY, DEFAULT_POLL_INTERVAL, DOMAIN_OPTIONS, QR_CHECKIN_SOURCE,
+    AUTO_CHECKIN_MODES, DEFAULT_AI_ANSWERING_MODE, DEFAULT_AUTO_CHECKIN, DEFAULT_AUTO_CHECKIN_MODE, DEFAULT_AUTO_CHECKIN_TIME,
+    DEFAULT_CHECKIN_DELAY, DEFAULT_POLL_INTERVAL, DOMAIN_OPTIONS, QR_CHECKIN_SOURCE,
     MAX_CHECKIN_DELAY, MAX_POLL_INTERVAL, MIN_CHECKIN_DELAY, MIN_POLL_INTERVAL,
     _config_lock,
     account_exists, api_url, delete_account,
     get_account, get_active_account_id, get_ai_config, get_checkin_source, get_config,
-    get_ai_answering_mode, get_auto_checkin, get_checkin_delay, get_course_config, get_domain, get_poll_interval, get_pushdeer_config, get_sessionid,
+    get_ai_answering_mode, get_auto_checkin, get_auto_checkin_mode, get_auto_checkin_time, get_checkin_delay, get_course_config, get_domain, get_poll_interval, get_pushdeer_config, get_sessionid,
     http_request, list_accounts_summary, make_headers, new_empty_account,
     save_config, set_active_account_id, set_domain, set_poll_interval,
-    set_ai_answering_enabled, set_ai_answering_mode, set_auto_checkin, set_checkin_delay, set_checkin_source, update_account, update_ai_config, update_course_config, update_pushdeer_config,
+    set_ai_answering_enabled, set_ai_answering_mode, set_auto_checkin_mode, set_checkin_delay, set_checkin_source, update_account, update_ai_config, update_course_config, update_pushdeer_config,
+    validate_auto_checkin_time,
     upsert_account,
 )
 from monitor import Monitor
@@ -399,13 +401,42 @@ class CheckinSourceBody(BaseModel):
 
 
 class AutoCheckinBody(BaseModel):
-    auto_checkin: bool
+    # ``auto_checkin`` remains accepted for older clients.
+    auto_checkin: Optional[bool] = None
+    auto_checkin_mode: Optional[Literal["on", "scheduled", "off"]] = None
+    auto_checkin_time: Optional[str] = None
+
+    @field_validator("auto_checkin_time")
+    @classmethod
+    def validate_time(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        return validate_auto_checkin_time(value)
 
 
 class AiAnsweringBody(BaseModel):
     ai_answering_mode: Optional[Literal["ai", "random", "off"]] = None
     # Backward-compatible request field for existing clients.
     ai_answering_enabled: Optional[bool] = None
+
+
+def _has_configured_ai_key(account_id: str) -> bool:
+    """Return whether the account has at least one non-empty AI API key."""
+    cfg = get_ai_config(account_id)
+    return any(
+        isinstance(entry, dict) and bool(str(entry.get("key", "")).strip())
+        for entry in cfg.get("keys", [])
+    )
+
+
+def _course_enables_ai_without_key(account_id: str, course_id: str, data: dict) -> bool:
+    """Detect a course-level transition into AI mode without a configured key."""
+    current = get_course_config(account_id, course_id)
+    return any(
+        data.get(f"type{problem_type}") == "ai"
+        and current.get(f"type{problem_type}") != "ai"
+        for problem_type in range(1, 6)
+    ) and not _has_configured_ai_key(account_id)
 
 
 class QRCheckinBody(BaseModel):
@@ -555,9 +586,15 @@ async def set_account_checkin_source(account_id: str, body: CheckinSourceBody):
 @app.get("/api/accounts/{account_id}/auto-checkin")
 async def get_account_auto_checkin(account_id: str):
     _require_account(account_id)
+    mode = get_auto_checkin_mode(account_id)
     return {
         "auto_checkin": get_auto_checkin(account_id),
         "default": DEFAULT_AUTO_CHECKIN,
+        "auto_checkin_mode": mode,
+        "auto_checkin_time": get_auto_checkin_time(account_id),
+        "default_mode": DEFAULT_AUTO_CHECKIN_MODE,
+        "default_time": DEFAULT_AUTO_CHECKIN_TIME,
+        "modes": list(AUTO_CHECKIN_MODES),
     }
 
 
@@ -565,11 +602,26 @@ async def get_account_auto_checkin(account_id: str):
 @app.patch("/api/accounts/{account_id}/auto-checkin")
 async def set_account_auto_checkin(account_id: str, body: AutoCheckinBody):
     _require_account(account_id)
-    enabled = set_auto_checkin(account_id, body.auto_checkin)
+    if body.auto_checkin_mode is None and body.auto_checkin is None and body.auto_checkin_time is None:
+        raise HTTPException(status_code=422, detail="auto_checkin_mode or auto_checkin is required")
+
+    mode = body.auto_checkin_mode
+    if mode is None:
+        mode = ("on" if body.auto_checkin else "off") if body.auto_checkin is not None else get_auto_checkin_mode(account_id)
+    mode, schedule_time = set_auto_checkin_mode(account_id, mode, body.auto_checkin_time)
     monitor = _get_monitor(account_id)
     if monitor:
         monitor.wake()
-    return {"ok": True, "auto_checkin": enabled}
+    return {
+        "ok": True,
+        "auto_checkin": get_auto_checkin(account_id),
+        "default": DEFAULT_AUTO_CHECKIN,
+        "auto_checkin_mode": mode,
+        "auto_checkin_time": schedule_time,
+        "default_mode": DEFAULT_AUTO_CHECKIN_MODE,
+        "default_time": DEFAULT_AUTO_CHECKIN_TIME,
+        "modes": list(AUTO_CHECKIN_MODES),
+    }
 
 
 @app.get("/api/accounts/{account_id}/ai-answering")
@@ -579,6 +631,7 @@ async def get_account_ai_answering(account_id: str):
     return {
         "ai_answering_mode": mode,
         "ai_answering_enabled": mode == "ai",
+        "ai_api_key_configured": _has_configured_ai_key(account_id),
         "default": DEFAULT_AI_ANSWERING_MODE,
     }
 
@@ -588,12 +641,33 @@ async def get_account_ai_answering(account_id: str):
 async def set_account_ai_answering(account_id: str, body: AiAnsweringBody):
     _require_account(account_id)
     if body.ai_answering_mode is not None:
+        mode = body.ai_answering_mode
+    elif body.ai_answering_enabled is not None:
+        mode = "ai" if body.ai_answering_enabled else "off"
+    else:
+        raise HTTPException(status_code=422, detail="ai_answering_mode is required")
+
+    if mode == "ai" and not _has_configured_ai_key(account_id):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "ai_api_key_required",
+                "message": "Configure an AI API key before enabling AI answering",
+            },
+        )
+
+    # Persist only after validation so an invalid AI enable request cannot
+    # leave the account in AI mode while silently falling back to random.
+    if body.ai_answering_mode is not None:
         mode = set_ai_answering_mode(account_id, body.ai_answering_mode)
     elif body.ai_answering_enabled is not None:
         mode = "ai" if set_ai_answering_enabled(account_id, body.ai_answering_enabled) else "off"
-    else:
-        raise HTTPException(status_code=422, detail="ai_answering_mode is required")
-    return {"ok": True, "ai_answering_mode": mode, "ai_answering_enabled": mode == "ai"}
+    return {
+        "ok": True,
+        "ai_answering_mode": mode,
+        "ai_answering_enabled": mode == "ai",
+        "ai_api_key_configured": _has_configured_ai_key(account_id),
+    }
 
 
 @app.post("/api/accounts/{account_id}/checkin/qr")
@@ -1035,6 +1109,14 @@ async def get_course_settings(account_id: str, course_id: str):
 async def update_course_settings(account_id: str, course_id: str, body: CourseConfig):
     _require_account(account_id)
     data = body.model_dump()
+    if _course_enables_ai_without_key(account_id, course_id, data):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "ai_api_key_required",
+                "message": "Configure an AI API key before enabling AI answering",
+            },
+        )
     update_course_config(account_id, course_id, data)
 
     m = _get_monitor(account_id)

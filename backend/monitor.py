@@ -10,7 +10,7 @@ from checkin import CheckinError
 from config import (
     DEFAULT_POLL_INTERVAL, MAX_POLL_INTERVAL, MIN_POLL_INTERVAL,
     api_url, get_account, get_course_config, get_domain, get_poll_interval,
-    get_auto_checkin, get_sessionid, http_request, make_headers, QR_CHECKIN_SOURCE, update_course_config,
+    get_auto_checkin, get_auto_checkin_mode, get_sessionid, http_request, make_headers, QR_CHECKIN_SOURCE, update_course_config,
 )
 from lesson import Lesson
 
@@ -226,8 +226,8 @@ class Monitor:
             if not already_tracked:
                 if not get_auto_checkin(self.account_id):
                     logger.info(
-                        "[%s] Skipping lesson %s: automatic check-in is disabled",
-                        self.account_id, lesson_id,
+                        "[%s] Skipping lesson %s: automatic check-in is not active (mode=%s)",
+                        self.account_id, lesson_id, get_auto_checkin_mode(self.account_id),
                     )
                     incoming_ids.discard(str(lesson_id))
                     continue

@@ -132,14 +132,14 @@ class QwenProvider(AIProvider):
 class DeepSeekProvider(AIProvider):
     """DeepSeek's OpenAI-compatible vision API.
 
-    Yuketang sends quiz slides as images, so the default model must be a
-    DeepSeek vision model rather than the text-only ``deepseek-chat`` model.
+    Yuketang sends quiz slides as images, so the default model must support
+    image input rather than using the text-only ``deepseek-chat`` model.
     The model name is kept here instead of exposing another setting: users
     only need to provide their DeepSeek API key.
     """
 
     BASE_URL = "https://api.deepseek.com"
-    DEFAULT_MODEL = "deepseek-v4-flash-vision-exp"
+    DEFAULT_MODEL = "deepseek-flash"
 
     def __init__(self, api_key: str, model: str = DEFAULT_MODEL):
         from openai import OpenAI

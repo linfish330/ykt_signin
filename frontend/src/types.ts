@@ -57,9 +57,16 @@ export interface CheckinSourceSettings {
   options: CheckinSourceOption[]
 }
 
+export type AutoCheckinMode = 'on' | 'scheduled' | 'off'
+
 export interface AutoCheckinSettings {
   auto_checkin: boolean
   default: boolean
+  auto_checkin_mode: AutoCheckinMode
+  auto_checkin_time: string
+  default_mode: AutoCheckinMode
+  default_time: string
+  modes: AutoCheckinMode[]
 }
 
 export type AiAnsweringMode = 'ai' | 'random' | 'off'
@@ -67,6 +74,7 @@ export type AiAnsweringMode = 'ai' | 'random' | 'off'
 export interface AiAnsweringSettings {
   ai_answering_mode: AiAnsweringMode
   ai_answering_enabled: boolean
+  ai_api_key_configured: boolean
   default: AiAnsweringMode
 }
 

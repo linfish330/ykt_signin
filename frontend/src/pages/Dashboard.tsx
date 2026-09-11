@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import type { AiAnsweringMode, AiAnsweringSettings, AutoCheckinSettings, CheckinSourceSettings, NotificationSub as VoiceConfig, CourseItem } from '../types'
+import type { AiAnsweringMode, AiAnsweringSettings, AutoCheckinMode, AutoCheckinSettings, CheckinSourceSettings, NotificationSub as VoiceConfig, CourseItem } from '../types'
 import { useAccounts } from '../hooks/useAccounts'
 
 interface ActiveLesson {
@@ -76,6 +76,13 @@ function normalizeAiAnsweringMode(settings: AiAnsweringSettings): AiAnsweringMod
     return settings.ai_answering_mode
   }
   return settings.ai_answering_enabled ? 'ai' : 'off'
+}
+
+function normalizeAutoCheckinMode(settings: AutoCheckinSettings): AutoCheckinMode {
+  if (settings.auto_checkin_mode === 'on' || settings.auto_checkin_mode === 'scheduled' || settings.auto_checkin_mode === 'off') {
+    return settings.auto_checkin_mode
+  }
+  return settings.auto_checkin ? 'on' : 'off'
 }
 
 function normalizePendingAnswer(message: Record<string, unknown>): PendingAnswer | null {
@@ -289,9 +296,13 @@ export default function Dashboard() {
   const [checkinSettings, setCheckinSettings] = useState<CheckinSourceSettings | null>(null)
   const [checkinSourceInput, setCheckinSourceInput] = useState('')
   const [checkinSourceSaveStatus, setCheckinSourceSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
-  const [autoCheckinEnabled, setAutoCheckinEnabled] = useState<boolean | null>(null)
+  const [autoCheckinMode, setAutoCheckinMode] = useState<AutoCheckinMode | null>(null)
+  const [autoCheckinTime, setAutoCheckinTime] = useState('')
+  const [savedAutoCheckinMode, setSavedAutoCheckinMode] = useState<AutoCheckinMode | null>(null)
+  const [savedAutoCheckinTime, setSavedAutoCheckinTime] = useState('')
   const [autoCheckinSaveStatus, setAutoCheckinSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
   const [aiAnsweringMode, setAiAnsweringMode] = useState<AiAnsweringMode | null>(null)
+  const [aiApiKeyConfigured, setAiApiKeyConfigured] = useState<boolean | null>(null)
   const [aiAnsweringSaveStatus, setAiAnsweringSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
   const [clearingEvents, setClearingEvents] = useState(false)
   const [pendingAnswers, setPendingAnswers] = useState<PendingAnswer[]>([])
@@ -358,13 +369,23 @@ export default function Dashboard() {
       .then(([source, auto, ai]: [CheckinSourceSettings, AutoCheckinSettings, AiAnsweringSettings]) => {
         setCheckinSettings(source)
         setCheckinSourceInput(String(source.checkin_source))
-        setAutoCheckinEnabled(auto.auto_checkin)
+        const mode = normalizeAutoCheckinMode(auto)
+        const scheduleTime = auto.auto_checkin_time || auto.default_time || '08:00'
+        setAutoCheckinMode(mode)
+        setAutoCheckinTime(scheduleTime)
+        setSavedAutoCheckinMode(mode)
+        setSavedAutoCheckinTime(scheduleTime)
         setAiAnsweringMode(normalizeAiAnsweringMode(ai))
+        setAiApiKeyConfigured(ai.ai_api_key_configured)
       })
       .catch(() => {
         setCheckinSettings(null)
-        setAutoCheckinEnabled(null)
+        setAutoCheckinMode(null)
+        setAutoCheckinTime('')
+        setSavedAutoCheckinMode(null)
+        setSavedAutoCheckinTime('')
         setAiAnsweringMode(null)
+        setAiApiKeyConfigured(null)
       })
   }, [accountId])
 
@@ -391,9 +412,13 @@ export default function Dashboard() {
       setCheckinSettings(null)
       setCheckinSourceInput('')
       setCheckinSourceSaveStatus('idle')
-      setAutoCheckinEnabled(null)
+      setAutoCheckinMode(null)
+      setAutoCheckinTime('')
+      setSavedAutoCheckinMode(null)
+      setSavedAutoCheckinTime('')
       setAutoCheckinSaveStatus('idle')
       setAiAnsweringMode(null)
+      setAiApiKeyConfigured(null)
       setAiAnsweringSaveStatus('idle')
       setPendingAnswers([])
       setAnswerActionId(null)
@@ -437,24 +462,33 @@ export default function Dashboard() {
     }
   }
 
-  const handleAutoCheckinChange = async (enabled: boolean) => {
-    if (!accountId || autoCheckinEnabled === null || enabled === autoCheckinEnabled) return
-    const previous = autoCheckinEnabled
-    setAutoCheckinEnabled(enabled)
+  const handleSaveAutoCheckin = async () => {
+    if (!accountId || autoCheckinMode === null || savedAutoCheckinMode === null) return
+    const previousMode = savedAutoCheckinMode
+    const previousTime = savedAutoCheckinTime
     setAutoCheckinSaveStatus('saving')
     try {
       const response = await fetch(`/api/accounts/${accountId}/auto-checkin`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ auto_checkin: enabled }),
+        body: JSON.stringify({
+          auto_checkin_mode: autoCheckinMode,
+          auto_checkin_time: autoCheckinTime,
+        }),
       })
       if (!response.ok) throw new Error('Save failed')
-      const data = await response.json() as { auto_checkin: boolean }
-      setAutoCheckinEnabled(data.auto_checkin)
+      const data = await response.json() as AutoCheckinSettings
+      const mode = normalizeAutoCheckinMode(data)
+      const scheduleTime = data.auto_checkin_time || autoCheckinTime
+      setAutoCheckinMode(mode)
+      setAutoCheckinTime(scheduleTime)
+      setSavedAutoCheckinMode(mode)
+      setSavedAutoCheckinTime(scheduleTime)
       setAutoCheckinSaveStatus('saved')
       setTimeout(() => setAutoCheckinSaveStatus('idle'), 2000)
     } catch {
-      setAutoCheckinEnabled(previous)
+      setAutoCheckinMode(previousMode)
+      setAutoCheckinTime(previousTime)
       setAutoCheckinSaveStatus('error')
     }
   }
@@ -462,6 +496,12 @@ export default function Dashboard() {
   const handleAiAnsweringChange = async (mode: AiAnsweringMode) => {
     if (!accountId || aiAnsweringMode === null || mode === aiAnsweringMode) return
     const previous = aiAnsweringMode
+
+    if (mode === 'ai' && !aiApiKeyConfigured) {
+      window.alert(t('dashboard.aiApiKeyRequired'))
+      return
+    }
+
     setAiAnsweringMode(mode)
     setAiAnsweringSaveStatus('saving')
     try {
@@ -470,8 +510,18 @@ export default function Dashboard() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ai_answering_mode: mode }),
       })
-      if (!response.ok) throw new Error('Save failed')
-      const data = await response.json() as AiAnsweringSettings
+      const data = await response.json() as AiAnsweringSettings & {
+        detail?: { code?: string }
+      }
+      if (!response.ok) {
+        if (data.detail?.code === 'ai_api_key_required') {
+          window.alert(t('dashboard.aiApiKeyRequired'))
+          setAiAnsweringMode(previous)
+          setAiAnsweringSaveStatus('idle')
+          return
+        }
+        throw new Error('Save failed')
+      }
       setAiAnsweringMode(normalizeAiAnsweringMode(data))
       setAiAnsweringSaveStatus('saved')
       setTimeout(() => setAiAnsweringSaveStatus('idle'), 2000)
@@ -851,20 +901,52 @@ export default function Dashboard() {
               <span className="dashboard-setting-help">{t('dashboard.autoCheckinDesc')}</span>
             </div>
             <div className="dashboard-setting-control">
-              <div className="toggle-group" role="group" aria-label={t('dashboard.autoCheckin')}>
-                <button
-                  className={`toggle-option ${autoCheckinEnabled === true ? 'selected' : ''}`}
-                  onClick={() => void handleAutoCheckinChange(true)}
-                  disabled={autoCheckinEnabled === null || autoCheckinSaveStatus === 'saving'}
+              <div className="checkin-source-control">
+                <select
+                  className="form-select"
+                  aria-label={t('dashboard.autoCheckin')}
+                  value={autoCheckinMode ?? 'off'}
+                  onChange={(event) => {
+                    setAutoCheckinMode(event.target.value as AutoCheckinMode)
+                    setAutoCheckinSaveStatus('idle')
+                  }}
+                  disabled={autoCheckinMode === null || autoCheckinSaveStatus === 'saving'}
                 >
-                  {t('common.on')}
-                </button>
+                  <option value="on">{t('dashboard.autoCheckinOn')}</option>
+                  <option value="scheduled">{t('dashboard.autoCheckinScheduled')}</option>
+                  <option value="off">{t('dashboard.autoCheckinOff')}</option>
+                </select>
+                {autoCheckinMode === 'scheduled' && (
+                  <input
+                    type="time"
+                    className="form-input-time"
+                    aria-label={t('dashboard.autoCheckinTime')}
+                    value={autoCheckinTime}
+                    onChange={(event) => {
+                      setAutoCheckinTime(event.target.value)
+                      setAutoCheckinSaveStatus('idle')
+                    }}
+                    disabled={autoCheckinSaveStatus === 'saving'}
+                  />
+                )}
                 <button
-                  className={`toggle-option ${autoCheckinEnabled === false ? 'selected' : ''}`}
-                  onClick={() => void handleAutoCheckinChange(false)}
-                  disabled={autoCheckinEnabled === null || autoCheckinSaveStatus === 'saving'}
+                  className={`btn btn-sm ${autoCheckinSaveStatus === 'saved' ? 'btn-success' : autoCheckinSaveStatus === 'error' ? 'btn-danger' : 'btn-primary'}`}
+                  onClick={() => void handleSaveAutoCheckin()}
+                  disabled={
+                    autoCheckinMode === null
+                    || savedAutoCheckinMode === null
+                    || autoCheckinSaveStatus === 'saving'
+                    || (
+                      autoCheckinMode === savedAutoCheckinMode
+                      && autoCheckinTime === savedAutoCheckinTime
+                    )
+                  }
                 >
-                  {t('common.off')}
+                  {autoCheckinSaveStatus === 'saving'
+                    ? t('settings.applying')
+                    : autoCheckinSaveStatus === 'saved'
+                      ? t('settings.applied')
+                      : t('settings.apply')}
                 </button>
               </div>
               {autoCheckinSaveStatus === 'saving' && <span className="dashboard-setting-status">{t('settings.applying')}</span>}

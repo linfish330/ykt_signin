@@ -53,7 +53,7 @@ class CheckinConfigTests(unittest.TestCase):
         self.add_account()
         self.assertEqual(config.get_checkin_source("account-1"), 21)
 
-    def test_custom_checkin_source_is_source_one(self):
+    def test_wechat_scan_checkin_source_is_source_one(self):
         self.add_account(checkin_source=1)
         self.assertEqual(config.get_checkin_source("account-1"), 1)
         self.assertEqual(
@@ -61,11 +61,50 @@ class CheckinConfigTests(unittest.TestCase):
             1,
         )
 
-    def test_auto_checkin_defaults_to_enabled_and_persists(self):
+    def test_login_defaults_to_yuketang_server(self):
+        self.assertEqual(config.DEFAULT_DOMAIN, "www.yuketang.cn")
+        self.assertEqual(config.new_empty_account()["domain"], "www.yuketang.cn")
+
+    def test_new_account_defaults_to_requested_checkin_settings(self):
         self.add_account()
+        self.assertEqual(config.get_poll_interval("account-1"), 60)
+        self.assertEqual(config.get_checkin_delay("account-1"), 60)
+        self.assertFalse(config.get_auto_checkin("account-1"))
+        self.assertEqual(config.get_auto_checkin_mode("account-1"), "off")
+        self.assertEqual(config.new_empty_account()["auto_checkin_time"], "08:00")
+
+    def test_auto_checkin_boolean_compatibility_persists(self):
+        self.add_account()
+        self.assertTrue(config.set_auto_checkin("account-1", True))
         self.assertTrue(config.get_auto_checkin("account-1"))
         self.assertFalse(config.set_auto_checkin("account-1", False))
         self.assertFalse(config.get_auto_checkin("account-1"))
+
+    def test_new_account_default_settings_api(self):
+        self.add_account()
+        with TestClient(app) as client:
+            poll = client.get("/api/accounts/account-1/poll-interval")
+            delay = client.get("/api/accounts/account-1/checkin-delay")
+            auto = client.get("/api/accounts/account-1/auto-checkin")
+
+        self.assertEqual(poll.json()["poll_interval"], 60)
+        self.assertEqual(poll.json()["default"], 60)
+        self.assertEqual(delay.json()["checkin_delay"], 60)
+        self.assertEqual(delay.json()["default"], 60)
+        self.assertFalse(auto.json()["auto_checkin"])
+        self.assertEqual(auto.json()["auto_checkin_mode"], "off")
+        self.assertFalse(auto.json()["default"])
+
+    def test_scheduled_auto_checkin_waits_until_local_start_time(self):
+        self.add_account()
+        mode, schedule_time = config.set_auto_checkin_mode("account-1", "scheduled", "09:00")
+        self.assertEqual((mode, schedule_time), ("scheduled", "09:00"))
+        with patch("config._time.strftime", return_value="08:59"):
+            self.assertFalse(config.get_auto_checkin("account-1"))
+        with patch("config._time.strftime", return_value="09:00"):
+            self.assertTrue(config.get_auto_checkin("account-1"))
+        self.assertEqual(config.get_auto_checkin_mode("account-1"), "scheduled")
+        self.assertEqual(config.get_auto_checkin_time("account-1"), "09:00")
 
     def test_ai_answering_defaults_to_enabled_and_persists(self):
         self.add_account()
@@ -108,9 +147,21 @@ class CheckinConfigTests(unittest.TestCase):
         self.assertEqual(off_mode.status_code, 200)
         self.assertEqual(config.get_ai_answering_mode("account-1"), "off")
 
-    def test_checkin_delay_defaults_to_zero_and_clamps(self):
+    def test_ai_answering_api_rejects_ai_without_api_key(self):
+        self.add_account(ai_answering_mode="random", ai_answering_enabled=False)
+        with TestClient(app) as client:
+            response = client.put(
+                "/api/accounts/account-1/ai-answering",
+                json={"ai_answering_mode": "ai"},
+            )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["detail"]["code"], "ai_api_key_required")
+        self.assertEqual(config.get_ai_answering_mode("account-1"), "random")
+
+    def test_checkin_delay_defaults_to_sixty_and_clamps(self):
         self.add_account()
-        self.assertEqual(config.get_checkin_delay("account-1"), 0)
+        self.assertEqual(config.get_checkin_delay("account-1"), 60)
         self.assertEqual(config.set_checkin_delay("account-1", 12), 12)
         self.assertEqual(config.set_checkin_delay("account-1", 999), config.MAX_CHECKIN_DELAY)
         self.assertEqual(config.get_checkin_delay("account-1"), config.MAX_CHECKIN_DELAY)
@@ -125,7 +176,7 @@ class CheckinConfigTests(unittest.TestCase):
             )
 
         self.assertEqual(initial.status_code, 200)
-        self.assertEqual(initial.json()["checkin_delay"], 0)
+        self.assertEqual(initial.json()["checkin_delay"], 60)
         self.assertEqual(updated.status_code, 200)
         self.assertEqual(updated.json()["checkin_delay"], 8)
 
@@ -139,10 +190,26 @@ class CheckinConfigTests(unittest.TestCase):
             )
 
         self.assertEqual(initial.status_code, 200)
-        self.assertTrue(initial.json()["auto_checkin"])
+        self.assertFalse(initial.json()["auto_checkin"])
+        self.assertEqual(initial.json()["auto_checkin_mode"], "off")
         self.assertEqual(updated.status_code, 200)
         self.assertFalse(updated.json()["auto_checkin"])
         self.assertFalse(config.get_auto_checkin("account-1"))
+
+    def test_auto_checkin_api_supports_scheduled_mode_and_time(self):
+        self.add_account()
+        with TestClient(app) as client:
+            scheduled = client.put(
+                "/api/accounts/account-1/auto-checkin",
+                json={"auto_checkin_mode": "scheduled", "auto_checkin_time": "23:15"},
+            )
+
+        self.assertEqual(scheduled.status_code, 200)
+        self.assertEqual(scheduled.json()["auto_checkin_mode"], "scheduled")
+        self.assertEqual(scheduled.json()["auto_checkin_time"], "23:15")
+        self.assertEqual(scheduled.json()["modes"], ["on", "scheduled", "off"])
+        self.assertEqual(config.get_auto_checkin_mode("account-1"), "scheduled")
+        self.assertEqual(config.get_auto_checkin_time("account-1"), "23:15")
 
     def test_clear_events_api_removes_current_account_history(self):
         self.add_account()
@@ -217,6 +284,31 @@ class CheckinConfigTests(unittest.TestCase):
         with TestClient(app) as client:
             response = client.put("/api/accounts/account-1/courses/settings/course-1", json=payload)
         self.assertEqual(response.status_code, 422)
+
+    def test_course_answer_mode_api_rejects_ai_transition_without_api_key(self):
+        self.add_account(courses={"course-1": {"type1": "random"}})
+        payload = {
+            "type1": "ai",
+            "type2": "random",
+            "type3": "random",
+            "type4": "off",
+            "type5": "random",
+            "course_enabled": True,
+            "answer_last5s": True,
+            "auto_danmu": True,
+            "auto_redpacket": True,
+            "danmu_threshold": 3,
+            "checkin_source": "inherit",
+            "notification": {"enabled": False, "signin": True, "problem": True, "call": True, "danmu": True, "red_packet": True},
+            "voice_notification": {"enabled": False, "signin": True, "problem": True, "call": True, "danmu": True, "red_packet": True},
+            "pushdeer_notification": {"enabled": False, "signin": True, "problem": True, "call": True, "danmu": True, "red_packet": True},
+        }
+        with TestClient(app) as client:
+            response = client.put("/api/accounts/account-1/courses/settings/course-1", json=payload)
+
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["detail"]["code"], "ai_api_key_required")
+        self.assertEqual(config.get_course_config("account-1", "course-1")["type1"], "random")
 
 
 class CheckinClientTests(unittest.TestCase):
@@ -435,7 +527,7 @@ class AiAnsweringSwitchTests(unittest.TestCase):
         self.assertEqual(submit.call_args.args[:4], ("problem-1", 1, ["B"], "ai"))
         self.assertEqual(submit.call_args.args[4], events[0][1]["answer_id"])
 
-    def test_unhandled_ai_popup_falls_back_to_random_before_deadline(self):
+    def test_unhandled_ai_popup_falls_back_to_random_eight_seconds_before_deadline(self):
         lesson = Lesson.__new__(Lesson)
         lesson.account_id = "account-1"
         lesson.lessonname = "Test lesson"
@@ -453,18 +545,83 @@ class AiAnsweringSwitchTests(unittest.TestCase):
             "ai",
         )
 
-        with patch.object(lesson, "_wait_for_pending_answer", return_value=(None, dict(pending))), patch.object(
+        with patch.object(lesson, "_wait_for_pending_answer", return_value=(None, dict(pending))) as wait_pending, patch.object(
             lesson, "_build_fallback_answer", return_value=(["B"], "random")
         ), patch.object(lesson, "_wait_for_delay", return_value=True), patch.object(
             lesson, "_submit_answer"
         ) as submit:
             lesson._wait_for_answer_confirmation(pending, 10, 0)
 
+        wait_pending.assert_called_once_with(
+            pending["answer_id"],
+            10,
+            0,
+            retain_on_timeout=True,
+            timeout_after=2.0,
+        )
         self.assertEqual([event[0] for event in events], ["answer_pending", "answer_updated", "answer_review_closed"])
         self.assertEqual(events[1][1]["source"], "random")
         self.assertTrue(events[1][1]["answer_ready"])
         submit.assert_called_once_with("problem-1", 1, ["B"], "random", pending["answer_id"])
         self.assertEqual(lesson._pending_answers, {})
+
+    def test_ai_fallback_preserves_ai_for_single_multiple_and_fill_in(self):
+        for problemtype, ai_answer in ((1, ["A"]), (2, ["A", "B"]), (4, "AI fill")):
+            lesson = Lesson.__new__(Lesson)
+            lesson.account_id = "account-1"
+            lesson.lessonname = "Test lesson"
+            lesson.lessonid = "lesson-1"
+            lesson._running = True
+            lesson.course_config = {}
+            lesson._pending_answers = {}
+            lesson._pending_answers_lock = threading.Lock()
+            lesson.on_event = lambda event_type, data: None
+            problem = {
+                "problemId": f"problem-{problemtype}",
+                "problemType": problemtype,
+                "options": [{"key": "A"}, {"key": "B"}],
+            }
+            pending = lesson._begin_answer_review(problem, problem["problemId"], problemtype, "ai")
+            self.assertTrue(lesson._update_pending_answer(pending["answer_id"], ai_answer, "ai", True))
+
+            with patch.object(lesson, "_wait_for_pending_answer", return_value=(None, dict(pending))), patch.object(
+                lesson, "_wait_for_delay", return_value=True
+            ), patch.object(lesson, "_submit_answer") as submit:
+                lesson._wait_for_answer_confirmation(pending, 10, 0)
+
+            submit.assert_called_once_with(
+                problem["problemId"], problemtype, ai_answer, "ai", pending["answer_id"]
+            )
+
+    def test_ai_fallback_uses_random_for_vote_and_short_answer(self):
+        for problemtype, ai_answer in ((3, ["A"]), (5, "AI short")):
+            lesson = Lesson.__new__(Lesson)
+            lesson.account_id = "account-1"
+            lesson.lessonname = "Test lesson"
+            lesson.lessonid = "lesson-1"
+            lesson._running = True
+            lesson.course_config = {}
+            lesson._pending_answers = {}
+            lesson._pending_answers_lock = threading.Lock()
+            lesson.on_event = lambda event_type, data: None
+            problem = {
+                "problemId": f"problem-{problemtype}",
+                "problemType": problemtype,
+                "options": [{"key": "A"}, {"key": "B"}],
+            }
+            pending = lesson._begin_answer_review(problem, problem["problemId"], problemtype, "ai")
+            self.assertTrue(lesson._update_pending_answer(pending["answer_id"], ai_answer, "ai", True))
+
+            with patch.object(lesson, "_wait_for_pending_answer", return_value=(None, dict(pending))), patch.object(
+                lesson, "_build_fallback_answer", return_value=("1", "random")
+            ), patch.object(lesson, "_wait_for_delay", return_value=True), patch.object(
+                lesson, "_submit_answer"
+            ) as submit:
+                lesson._wait_for_answer_confirmation(pending, 10, 0)
+
+            submit.assert_called_once_with(
+                problem["problemId"], problemtype, "1", "random", pending["answer_id"]
+            )
 
     def test_random_policy_and_confirmation_flow(self):
         lesson = Lesson.__new__(Lesson)
@@ -559,6 +716,12 @@ class ApiValidationTests(unittest.TestCase):
             QRCheckinBody(url="   ")
         self.assertEqual(QRCheckinBody(url="  qr-content  ").url, "qr-content")
         self.assertFalse(AutoCheckinBody(auto_checkin=False).auto_checkin)
+        self.assertEqual(
+            AutoCheckinBody(auto_checkin_mode="scheduled", auto_checkin_time="09:30").auto_checkin_time,
+            "09:30",
+        )
+        with self.assertRaises(ValueError):
+            AutoCheckinBody(auto_checkin_mode="scheduled", auto_checkin_time="25:00")
         self.assertFalse(AiAnsweringBody(ai_answering_enabled=False).ai_answering_enabled)
         self.assertEqual(CheckinDelayBody(checkin_delay=12).checkin_delay, 12)
 
@@ -577,7 +740,7 @@ class DeepSeekTests(unittest.TestCase):
         self.temp_dir.cleanup()
 
     @patch("openai.OpenAI")
-    def test_deepseek_provider_uses_vision_model_and_openai_endpoint(self, openai_client):
+    def test_deepseek_provider_uses_flash_model_and_openai_endpoint(self, openai_client):
         openai_client.return_value.chat.completions.create.return_value = SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=" A "))]
         )
@@ -591,7 +754,7 @@ class DeepSeekTests(unittest.TestCase):
             api_key="sk-test",
         )
         request = openai_client.return_value.chat.completions.create.call_args
-        self.assertEqual(request.kwargs["model"], "deepseek-v4-flash-vision-exp")
+        self.assertEqual(request.kwargs["model"], "deepseek-flash")
         self.assertEqual(request.kwargs["messages"][0]["content"][0]["type"], "text")
 
     def test_deepseek_key_endpoint_only_requires_api_key_and_activates_it(self):

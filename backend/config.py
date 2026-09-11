@@ -2,6 +2,7 @@ import copy
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time as _time
@@ -92,7 +93,7 @@ CHECKIN_SOURCE_OPTIONS = [
     {"value": 5, "label": "WeChat / Mini Program", "label_zh": "微信/小程序"},
     {"value": 14, "label": "PC / Web", "label_zh": "PC / Web"},
     {"value": 22, "label": "Passcode", "label_zh": "暗号"},
-    {"value": 1, "label": "Custom", "label_zh": "自定义"},
+    {"value": 1, "label": "WeChat / Scan QR Code", "label_zh": "微信/扫二维码"},
 ]
 CHECKIN_SOURCE_VALUES = frozenset(option["value"] for option in CHECKIN_SOURCE_OPTIONS)
 DEFAULT_CHECKIN_SOURCE = 21
@@ -119,10 +120,13 @@ DEFAULT_PUSHDEER_CONFIG: dict = {"keys": [], "active_key": -1, "language": "zh"}
 DEFAULT_POLL_INTERVAL = 60
 MIN_POLL_INTERVAL = 10
 MAX_POLL_INTERVAL = 3600
-DEFAULT_AUTO_CHECKIN = True
+DEFAULT_AUTO_CHECKIN = False
+AUTO_CHECKIN_MODES = ("on", "scheduled", "off")
+DEFAULT_AUTO_CHECKIN_MODE = "off"
+DEFAULT_AUTO_CHECKIN_TIME = "08:00"
 DEFAULT_AI_ANSWERING_ENABLED = True
 DEFAULT_AI_ANSWERING_MODE = "ai"
-DEFAULT_CHECKIN_DELAY = 0
+DEFAULT_CHECKIN_DELAY = 60
 MIN_CHECKIN_DELAY = 0
 MAX_CHECKIN_DELAY = 300
 
@@ -133,7 +137,7 @@ DOMAIN_OPTIONS = [
     {"key": "huanghe.yuketang.cn", "label": "Huanghe Yuketang", "label_zh": "黄河雨课堂"},
 ]
 
-DEFAULT_DOMAIN = "pro.yuketang.cn"
+DEFAULT_DOMAIN = "www.yuketang.cn"
 
 
 def new_empty_account(domain: str = DEFAULT_DOMAIN) -> dict:
@@ -149,6 +153,8 @@ def new_empty_account(domain: str = DEFAULT_DOMAIN) -> dict:
         "poll_interval": DEFAULT_POLL_INTERVAL,
         "checkin_delay": DEFAULT_CHECKIN_DELAY,
         "auto_checkin": DEFAULT_AUTO_CHECKIN,
+        "auto_checkin_mode": DEFAULT_AUTO_CHECKIN_MODE,
+        "auto_checkin_time": DEFAULT_AUTO_CHECKIN_TIME,
         "ai_answering_enabled": DEFAULT_AI_ANSWERING_ENABLED,
         "ai_answering_mode": DEFAULT_AI_ANSWERING_MODE,
         "checkin_source": DEFAULT_CHECKIN_SOURCE,
@@ -186,17 +192,68 @@ def set_checkin_delay(account_id: str, seconds: int) -> int:
     return clamped
 
 
-def get_auto_checkin(account_id: str) -> bool:
-    """Get the account-level automatic classroom check-in switch."""
+def get_auto_checkin_mode(account_id: str) -> str:
+    """Get the account-level automatic check-in mode with legacy migration."""
     acc = get_account(account_id) or {}
-    value = acc.get("auto_checkin", DEFAULT_AUTO_CHECKIN)
-    return value if isinstance(value, bool) else DEFAULT_AUTO_CHECKIN
+    value = acc.get("auto_checkin_mode")
+    if isinstance(value, str) and value in AUTO_CHECKIN_MODES:
+        return value
+    legacy = acc.get("auto_checkin")
+    if isinstance(legacy, bool):
+        return "on" if legacy else "off"
+    return DEFAULT_AUTO_CHECKIN_MODE
+
+
+def validate_auto_checkin_time(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("auto_checkin_time must use HH:MM format")
+    value = value.strip()
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
+        raise ValueError("auto_checkin_time must use HH:MM format")
+    return value
+
+
+def get_auto_checkin_time(account_id: str) -> str:
+    acc = get_account(account_id) or {}
+    try:
+        return validate_auto_checkin_time(acc.get("auto_checkin_time", DEFAULT_AUTO_CHECKIN_TIME))
+    except ValueError:
+        return DEFAULT_AUTO_CHECKIN_TIME
+
+
+def set_auto_checkin_mode(
+    account_id: str,
+    mode: str,
+    start_time: Optional[str] = None,
+) -> tuple[str, str]:
+    if mode not in AUTO_CHECKIN_MODES:
+        raise ValueError("auto_checkin_mode must be on, scheduled, or off")
+    schedule_time = get_auto_checkin_time(account_id) if start_time is None else validate_auto_checkin_time(start_time)
+    update_account(account_id, {
+        "auto_checkin_mode": mode,
+        "auto_checkin_time": schedule_time,
+        # Keep the legacy field enabled for the scheduled mode so older
+        # clients do not accidentally treat it as permanently disabled.
+        "auto_checkin": mode != "off",
+    })
+    return mode, schedule_time
+
+
+def get_auto_checkin(account_id: str) -> bool:
+    """Return whether automatic check-in is active at the current local time."""
+    mode = get_auto_checkin_mode(account_id)
+    if mode == "off":
+        return False
+    if mode == "scheduled":
+        return _time.strftime("%H:%M") >= get_auto_checkin_time(account_id)
+    return True
 
 
 def set_auto_checkin(account_id: str, enabled: bool) -> bool:
+    """Backward-compatible boolean setter for older API clients."""
     if not isinstance(enabled, bool):
         raise ValueError("auto_checkin must be a boolean")
-    update_account(account_id, {"auto_checkin": enabled})
+    set_auto_checkin_mode(account_id, "on" if enabled else "off")
     return enabled
 
 

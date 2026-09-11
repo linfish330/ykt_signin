@@ -46,7 +46,7 @@ export default function AccountSwitcher() {
 
   return (
     <div className="account-switcher" ref={ref}>
-      <button className="account-switcher-trigger btn-ghost btn-sm" onClick={() => setOpen((v) => !v)}>
+      <button className="account-switcher-trigger btn btn-ghost btn-sm" onClick={() => setOpen((v) => !v)}>
         <span className="account-name">{label}</span>
         <span className="account-caret">▾</span>
       </button>

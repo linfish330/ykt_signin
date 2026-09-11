@@ -30,6 +30,10 @@ URL_PROBLEM_ANSWER = "https://{domain}/api/v3/lesson/problem/answer"
 URL_PRESENTATION_FETCH = "https://{domain}/api/v3/lesson/presentation/fetch?presentation_id={presentation_id}"
 URL_REDENVELOPE_PREPARE = "https://{domain}/api/v3/lesson/redenvelope/prepare"
 
+# Keep enough time for the random fallback to be submitted before the deadline
+# when the user does not confirm an AI/random candidate.
+ANSWER_AUTO_FALLBACK_SECONDS = 8
+
 
 class Lesson:
     def __init__(
@@ -489,9 +493,9 @@ class Lesson:
         })
 
     def _wait_for_answer_confirmation(self, pending: dict, limit: int, start_time: float) -> None:
-        # Give the user the full review window, but switch to the random policy
-        # when there are only five seconds left and no decision was made.
-        fallback_at = float(limit - 5) if limit > 0 else None
+        # Give the user the full review window, then apply the final fallback
+        # policy when there are only eight seconds left and no decision was made.
+        fallback_at = float(limit - ANSWER_AUTO_FALLBACK_SECONDS) if limit > 0 else None
         decision, resolved = self._wait_for_pending_answer(
             pending["answer_id"],
             limit,
@@ -512,22 +516,43 @@ class Lesson:
                 self._emit_answer_review_closed(pending, resolved, "expired")
                 return
 
-            if resolved.get("source") == "random" and resolved.get("answer_ready") and resolved.get("answer") is not None:
+            problemtype = resolved.get("problemtype")
+            try:
+                problemtype = int(problemtype)
+            except (TypeError, ValueError):
+                problemtype = 0
+
+            # For AI mode, preserve a ready AI answer for single-choice,
+            # multiple-choice, and fill-in questions. Other question types
+            # must switch to the random policy at the fallback boundary.
+            use_ai_fallback = (
+                resolved.get("source") == "ai"
+                and resolved.get("answer_ready")
+                and resolved.get("answer") is not None
+                and problemtype in {1, 2, 4}
+            )
+            if use_ai_fallback:
                 fallback_answer = resolved["answer"]
+                fallback_source = "ai"
+            elif resolved.get("source") == "random" and resolved.get("answer_ready") and resolved.get("answer") is not None:
+                fallback_answer = resolved["answer"]
+                fallback_source = "random"
             else:
-                fallback_answer, _ = self._build_fallback_answer(resolved["problem"], resolved["problemtype"])
+                fallback_answer, fallback_source = self._build_fallback_answer(
+                    resolved["problem"], resolved["problemtype"]
+                )
 
             if fallback_answer is None:
                 self._pop_pending_answer(answer_id)
                 self._emit_answer_review_closed(pending, resolved, "no_answer")
                 return
 
-            if not self._update_pending_answer(answer_id, fallback_answer, "random", True):
-                # A skip may race with the five-second fallback boundary.
+            if not self._update_pending_answer(answer_id, fallback_answer, fallback_source, True):
+                # A skip may race with the eight-second fallback boundary.
                 self._pop_pending_answer(answer_id)
                 return
             resolved["answer"] = fallback_answer
-            resolved["source"] = "random"
+            resolved["source"] = fallback_source
             resolved["answer_ready"] = True
             self._pop_pending_answer(answer_id)
             if not self._wait_for_delay(start_time, limit):
@@ -538,7 +563,7 @@ class Lesson:
                 resolved["problemid"],
                 resolved["problemtype"],
                 resolved["answer"],
-                "random",
+                fallback_source,
                 answer_id,
             )
             return

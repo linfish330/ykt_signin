@@ -287,9 +287,9 @@ export default function Login() {
                   />
                 </div>
                 {pwError && (
-                  <p style={{ color: 'var(--color-error, #e53e3e)', fontSize: '0.85rem', marginBottom: '0.75rem' }}>
+                  <div className="form-error" style={{ marginBottom: '0.75rem' }}>
                     {pwError}
-                  </p>
+                  </div>
                 )}
                 <button
                   className="btn btn-primary"
